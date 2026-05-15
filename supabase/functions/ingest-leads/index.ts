@@ -10,9 +10,20 @@ import { getServiceClient } from '../_shared/supabase-client.ts';
 
 const MAKE_SECRET = Deno.env.get('MAKE_WEBHOOK_SECRET') ?? '';
 
+// Columns the ingest pipeline is allowed to write — everything else is dropped.
+const ALLOWED_COLUMNS = new Set([
+  'full_name', 'entity_name', 'email', 'phone', 'linkedin_url', 'instagram_handle',
+  'rep_name', 'rep_email', 'rep_phone', 'rep_agency', 'bant_score', 'motivation_score',
+  'routing', 'property_address', 'motivation_signals', 'ai_summary', 'isa_talking_points',
+  'source_url', 'source_name', 'contract_value', 'team_name', 'sport', 'origin_country',
+  'employer', 'production_name', 'permit_number', 'price_range_min', 'price_range_max',
+  'timeline_months', 'raw_data', 'state', 'county',
+]);
+
 serve(async (req) => {
   if (req.method !== 'POST') return json({ success: false, error: 'Method not allowed' }, 405);
-  if (MAKE_SECRET && req.headers.get('x-make-secret') !== MAKE_SECRET) {
+  if (!MAKE_SECRET) return json({ success: false, error: 'Server misconfigured' }, 500);
+  if (req.headers.get('x-make-secret') !== MAKE_SECRET) {
     return json({ success: false, error: 'Unauthorized' }, 401);
   }
 
@@ -22,8 +33,8 @@ serve(async (req) => {
 
   // Accept either batch format { segment, market, leads: [] }
   // or single-lead format (segment + market + all lead fields directly)
-  const segment         = body.segment as string;
-  const market          = body.market  as string;
+  const segment           = body.segment as string;
+  const market            = body.market  as string;
   const commission_source = (body.commission_source as string) ?? 'inrange_generated';
   const leads: Record<string, unknown>[] = Array.isArray(body.leads)
     ? body.leads
@@ -38,44 +49,54 @@ serve(async (req) => {
   const errors: string[] = [];
 
   for (const raw of leads) {
-    // Normalize camelCase (Apify ESPN format) → snake_case (isa_leads columns)
     const normalized = normalizeLeadFields(raw, segment);
-    const identifier = (normalized.full_name ?? normalized.entity_name ?? null) as string | null;
+    const identifier  = (normalized.full_name ?? normalized.entity_name ?? null) as string | null;
     if (!identifier) { errors.push('Skipped: no full_name or entity_name'); continue; }
 
     try {
-      // Check for active duplicate
-      const { data: existing } = await supabase
+      // Dedup check: two separate .eq() calls to avoid unescaped OR filter issues
+      // with names containing apostrophes, commas, or other special characters.
+      const base = supabase
         .from('isa_leads')
         .select('id, outreach_status')
         .eq('segment', segment)
         .eq('market', market)
-        .or(`full_name.eq.${identifier},entity_name.eq.${identifier}`)
-        .not('outreach_status', 'in', '("dead","closed")')
-        .maybeSingle();
+        .not('outreach_status', 'in', '("dead","closed")');
+
+      const [{ data: byFull }, { data: byEntity }] = await Promise.all([
+        base.eq('full_name', identifier).maybeSingle(),
+        base.eq('entity_name', identifier).maybeSingle(),
+      ]);
+      const existing = byFull ?? byEntity;
+
+      // Only write columns we explicitly allow — prevents unknown Apify fields
+      // from hitting the DB and guards against field injection via payload.
+      const safe = pickAllowed(normalized);
 
       if (existing) {
-        // Refresh signals + contact info without resetting workflow
         await supabase.from('isa_leads').update({
-          motivation_signals: normalized.motivation_signals ?? [],
-          raw_data: normalized.raw_data ?? {},
-          source_url: normalized.source_url,
-          ...(normalized.phone     && { phone:     normalized.phone }),
-          ...(normalized.email     && { email:     normalized.email }),
-          ...(normalized.rep_name  && { rep_name:  normalized.rep_name }),
-          ...(normalized.rep_phone && { rep_phone: normalized.rep_phone }),
-          ...(normalized.rep_email && { rep_email: normalized.rep_email }),
+          raw_data:   safe.raw_data  ?? {},
+          source_url: safe.source_url,
+          // Only overwrite signals if the new run actually returned some;
+          // avoids wiping manually-added signals on actor changes.
+          ...(Array.isArray(safe.motivation_signals) && safe.motivation_signals.length > 0
+            ? { motivation_signals: safe.motivation_signals }
+            : {}),
+          ...(safe.phone     && { phone:     safe.phone }),
+          ...(safe.email     && { email:     safe.email }),
+          ...(safe.rep_name  && { rep_name:  safe.rep_name }),
+          ...(safe.rep_phone && { rep_phone: safe.rep_phone }),
+          ...(safe.rep_email && { rep_email: safe.rep_email }),
           updated_at: new Date().toISOString(),
         }).eq('id', existing.id);
       } else {
         await supabase.from('isa_leads').insert({
           segment, market, commission_source,
-          routing: normalized.routing ?? 'new',
           outreach_status: 'new',
-          motivation_signals: normalized.motivation_signals ?? [],
-          isa_talking_points: normalized.isa_talking_points ?? [],
-          raw_data: normalized.raw_data ?? {},
-          ...normalized,
+          motivation_signals: safe.motivation_signals ?? [],
+          isa_talking_points: safe.isa_talking_points ?? [],
+          raw_data: safe.raw_data ?? {},
+          ...safe,
         });
       }
       upserted++;
@@ -87,8 +108,13 @@ serve(async (req) => {
   return json({ success: true, data: { fetched: leads.length, upserted, errors } });
 });
 
+function pickAllowed(obj: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(obj).filter(([k]) => ALLOWED_COLUMNS.has(k))
+  );
+}
+
 // ─── Field normalizer ──────────────────────────────────────────────────────────
-// Handles ESPN/Apify camelCase → isa_leads snake_case, plus segment-specific logic.
 function normalizeLeadFields(
   raw: Record<string, unknown>,
   segment: string
@@ -119,35 +145,31 @@ function normalizeLeadFields(
   if (segment === 'athlete') {
     if (raw.league && !raw.sport) norm.sport = raw.league;
 
-    // Auto-derive routing from experience
     const exp = Number(raw.experience ?? raw.experienceYears ?? 0);
     if (!raw.routing) {
       norm.routing = exp >= 8 ? 'warm' : exp >= 4 ? 'warm' : exp >= 1 ? 'nurture' : 'cold';
     }
 
-    // Auto-derive price range from league+experience
     const league = String(raw.league ?? raw.sport ?? '');
     if (!raw.price_range_min && !raw.priceRangeMin) {
-      if (league === 'nba')       { norm.price_range_min = exp >= 5 ? 2000000 : 800000; norm.price_range_max = exp >= 5 ? 7000000 : 2000000; }
-      else if (league === 'nfl')  { norm.price_range_min = exp >= 5 ? 1500000 : 600000; norm.price_range_max = exp >= 5 ? 5000000 : 1500000; }
-      else if (league === 'mlb')  { norm.price_range_min = exp >= 5 ? 1000000 : 500000; norm.price_range_max = exp >= 5 ? 3000000 : 1200000; }
-      else if (league === 'nhl')  { norm.price_range_min = exp >= 5 ? 800000  : 400000; norm.price_range_max = exp >= 5 ? 2500000 : 1000000; }
+      if (league === 'nba')       { norm.price_range_min = exp >= 5 ? 2000000 : 800000;  norm.price_range_max = exp >= 5 ? 7000000 : 2000000; }
+      else if (league === 'nfl')  { norm.price_range_min = exp >= 5 ? 1500000 : 600000;  norm.price_range_max = exp >= 5 ? 5000000 : 1500000; }
+      else if (league === 'mlb')  { norm.price_range_min = exp >= 5 ? 1000000 : 500000;  norm.price_range_max = exp >= 5 ? 3000000 : 1200000; }
+      else if (league === 'nhl')  { norm.price_range_min = exp >= 5 ? 800000  : 400000;  norm.price_range_max = exp >= 5 ? 2500000 : 1000000; }
       else if (league === 'mls')  { norm.price_range_min = 400000;  norm.price_range_max = 1200000; }
     }
 
-    // Build motivation signals
     if (!Array.isArray(norm.motivation_signals) || (norm.motivation_signals as unknown[]).length === 0) {
       const signals: string[] = [];
       const status = String(raw.status ?? 'Active');
-      if (exp >= 5)    signals.push(`${exp}-year veteran — peak earning window`);
-      if (exp >= 10)   signals.push('Late career — diversification priority');
-      if (exp === 0)   signals.push('Rookie contract — first big income, housing need');
+      if (exp >= 5)  signals.push(`${exp}-year veteran — peak earning window`);
+      if (exp >= 10) signals.push('Late career — diversification priority');
+      if (exp === 0) signals.push('Rookie contract — first big income, housing need');
       signals.push(`Active ${String(raw.teamName ?? raw.team_name ?? '')} ${league.toUpperCase()} player`);
       signals.push(`NY metro market — ${status.toLowerCase()} roster`);
       norm.motivation_signals = signals;
     }
 
-    // Preserve all ESPN fields in raw_data
     norm.raw_data = {
       league: raw.league, teamAbbreviation: raw.teamAbbreviation,
       position: raw.position, jersey: raw.jersey,
@@ -156,7 +178,7 @@ function normalizeLeadFields(
     };
   }
 
-  // Remove camelCase duplicates to avoid spurious columns
+  // Remove camelCase duplicates
   const camelKeys = ['fullName','entityName','teamName','repName','repEmail','repPhone',
     'repAgency','sourceUrl','sourceName','productionName','permitNumber','contractValue',
     'originCountry','priceRangeMin','priceRangeMax','timelineMonths',

@@ -13,7 +13,8 @@ const MAKE_SECRET       = Deno.env.get('MAKE_WEBHOOK_SECRET') ?? '';
 
 serve(async (req) => {
   if (req.method !== 'POST') return json({ success: false, error: 'Method not allowed' }, 405);
-  if (MAKE_SECRET && req.headers.get('x-make-secret') !== MAKE_SECRET) {
+  if (!MAKE_SECRET) return json({ success: false, error: 'Server misconfigured' }, 500);
+  if (req.headers.get('x-make-secret') !== MAKE_SECRET) {
     return json({ success: false, error: 'Unauthorized' }, 401);
   }
 
@@ -23,12 +24,14 @@ serve(async (req) => {
 
   const supabase = getServiceClient();
 
+  // Newest-first so freshly ingested hot leads (athletes, new signings)
+  // get enriched within hours rather than days behind older nurture leads.
   let query = supabase
     .from('isa_leads')
     .select('*')
     .is('ai_summary', null)
     .not('outreach_status', 'in', '("dead","closed")')
-    .order('created_at', { ascending: true })
+    .order('created_at', { ascending: false })
     .limit(limit);
 
   if (segment) query = query.eq('segment', segment);
@@ -44,7 +47,7 @@ serve(async (req) => {
     try {
       const result = await callClaude(buildPrompt(lead));
       await supabase.from('isa_leads').update({
-        ai_summary:        result.ai_summary,
+        ai_summary:         result.ai_summary,
         isa_talking_points: result.isa_talking_points,
         bant_score:         result.bant_score,
         motivation_score:   result.motivation_score,
@@ -67,14 +70,14 @@ function buildPrompt(lead: Record<string, unknown>): string {
 PROSPECT:
 Segment: ${lead.segment} | Market: ${lead.market}
 Name: ${lead.full_name ?? lead.entity_name ?? 'Unknown'}
-${lead.team_name     ? `Team: ${lead.team_name}`                          : ''}
-${lead.sport         ? `Sport: ${lead.sport}`                             : ''}
-${lead.contract_value ? `Contract: $${Number(lead.contract_value).toLocaleString()}` : ''}
-${lead.employer      ? `Employer: ${lead.employer}`                       : ''}
-${lead.origin_country ? `From: ${lead.origin_country}`                   : ''}
-${lead.production_name ? `Production: ${lead.production_name}`            : ''}
-${lead.property_address ? `Property: ${lead.property_address}`           : ''}
-${lead.price_range_min ? `Budget: $${Number(lead.price_range_min).toLocaleString()}–$${Number(lead.price_range_max).toLocaleString()}` : ''}
+${lead.team_name       ? `Team: ${lead.team_name}`                           : ''}
+${lead.sport           ? `Sport: ${lead.sport}`                              : ''}
+${lead.contract_value  ? `Contract: $${Number(lead.contract_value).toLocaleString()}` : ''}
+${lead.employer        ? `Employer: ${lead.employer}`                        : ''}
+${lead.origin_country  ? `From: ${lead.origin_country}`                      : ''}
+${lead.production_name ? `Production: ${lead.production_name}`               : ''}
+${lead.property_address ? `Property: ${lead.property_address}`               : ''}
+${lead.price_range_min  ? `Budget: $${Number(lead.price_range_min).toLocaleString()}–$${Number(lead.price_range_max).toLocaleString()}` : ''}
 Signals: ${signals || 'None captured'}
 Source: ${lead.source_name ?? 'unknown'}
 
@@ -111,9 +114,13 @@ async function callClaude(prompt: string) {
   });
   if (!res.ok) throw new Error(`Anthropic ${res.status}`);
   const data = await res.json();
-  const text = (data.content[0]?.text ?? '{}')
-    .replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-  return JSON.parse(text);
+  const raw  = (data.content[0]?.text ?? '{}');
+  // Robustly extract JSON — strip markdown fences then find first { ... } block.
+  const stripped = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+  const start    = stripped.indexOf('{');
+  const end      = stripped.lastIndexOf('}');
+  if (start === -1 || end === -1) throw new Error('No JSON object in Claude response');
+  return JSON.parse(stripped.slice(start, end + 1));
 }
 
 function json(body: unknown, status = 200): Response {

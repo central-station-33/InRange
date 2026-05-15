@@ -12,7 +12,8 @@ const MAKE_SECRET = Deno.env.get('MAKE_WEBHOOK_SECRET') ?? '';
 
 serve(async (req) => {
   if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
-  if (MAKE_SECRET && req.headers.get('x-make-secret') !== MAKE_SECRET) {
+  if (!MAKE_SECRET) return json({ error: 'Server misconfigured' }, 500);
+  if (req.headers.get('x-make-secret') !== MAKE_SECRET) {
     return json({ error: 'Unauthorized' }, 401);
   }
 
@@ -39,7 +40,7 @@ serve(async (req) => {
   if (error) return json({ error: error.message }, 500);
   if (!leads?.length) return json({ assigned: 0 });
 
-  // Fetch routing rules with current agent workloads
+  // Fetch routing rules with current agent metadata
   const { data: rules } = await supabase
     .from('agent_routing_rules')
     .select(`
@@ -49,24 +50,18 @@ serve(async (req) => {
     .eq('team_agents.status', 'active')
     .order('priority', { ascending: true });
 
-  // Count current active leads per agent
-  const { data: workloads } = await supabase
-    .from('isa_leads')
-    .select('assigned_agent_id')
-    .not('outreach_status', 'in', '("dead","closed")')
-    .not('assigned_agent_id', 'is', null);
+  // Use DB aggregate instead of fetching all lead rows to count per-agent load.
+  // Avoids O(n) network transfer as the pipeline grows to thousands of leads.
+  const { data: workloadRows } = await supabase.rpc('agent_workload_counts');
 
   const agentLoad: Record<string, number> = {};
-  for (const w of workloads ?? []) {
-    if (w.assigned_agent_id) {
-      agentLoad[w.assigned_agent_id] = (agentLoad[w.assigned_agent_id] ?? 0) + 1;
-    }
+  for (const row of workloadRows ?? []) {
+    agentLoad[row.assigned_agent_id] = Number(row.active_leads);
   }
 
   let assigned = 0;
 
   for (const lead of leads) {
-    // Find best matching rule for this lead
     const candidates = (rules ?? [])
       .filter(r => {
         const segMatch = r.segment === null || r.segment === lead.segment;
@@ -74,7 +69,11 @@ serve(async (req) => {
         return segMatch && mktMatch;
       })
       .filter(r => (agentLoad[r.agent_id] ?? 0) < r.max_active_leads)
-      .sort((a, b) => a.priority - b.priority);
+      // Secondary sort by current load so equal-priority agents share work evenly.
+      .sort((a, b) =>
+        a.priority - b.priority ||
+        (agentLoad[a.agent_id] ?? 0) - (agentLoad[b.agent_id] ?? 0)
+      );
 
     const best = candidates[0];
     if (!best) continue;

@@ -22,7 +22,8 @@ const STATUS_ADVANCE: Record<string, string> = {
 
 serve(async (req) => {
   if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
-  if (MAKE_SECRET && req.headers.get('x-make-secret') !== MAKE_SECRET) {
+  if (!MAKE_SECRET) return json({ error: 'Server misconfigured' }, 500);
+  if (req.headers.get('x-make-secret') !== MAKE_SECRET) {
     return json({ error: 'Unauthorized' }, 401);
   }
 
@@ -35,15 +36,14 @@ serve(async (req) => {
 
   const supabase = getServiceClient();
 
-  // Get current touch count
-  const { count } = await supabase
-    .from('lead_touches')
-    .select('*', { count: 'exact', head: true })
-    .eq('lead_id', lead_id);
+  // Get next touch number atomically via DB function to avoid duplicate
+  // touch_numbers when two ISAs log touches concurrently for the same lead.
+  const { data: touchNum, error: rpcErr } = await supabase
+    .rpc('next_touch_number', { p_lead_id: lead_id });
 
-  const touchNumber = (count ?? 0) + 1;
+  if (rpcErr) return json({ error: rpcErr.message }, 500);
+  const touchNumber = touchNum as number;
 
-  // Write the touch
   const { error: touchErr } = await supabase.from('lead_touches').insert({
     lead_id,
     touch_number: touchNumber,
@@ -65,7 +65,6 @@ serve(async (req) => {
 
   if (newStatus) updatePayload.outreach_status = newStatus;
 
-  // Special case: appointment_set is terminal advance
   if (outcome === 'appointment_set') {
     updatePayload.outreach_status = 'appointment_set';
     updatePayload.routing = 'hot';
