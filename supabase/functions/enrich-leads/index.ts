@@ -1,17 +1,12 @@
 /**
  * enrich-leads — Claude AI enrichment for ISA leads.
+ * Scores BANT, motivation, routing, writes talking points.
  *
- * For each unenriched lead (ai_summary IS NULL), calls Claude to:
- *   1. Write a 2-sentence ISA brief
- *   2. Generate 3 specific talking points for first contact
- *   3. Score BANT (0–12) and motivation (1–5) and set routing
- *
- * POST body: { limit?: number, segment?: string }
+ * POST body: { limit?: number, segment?: string, routing?: string }
  */
 
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
-import { createClient } from '../_shared/supabase-client.ts';
-import type { Lead, LeadRouting, EdgeFnResponse } from '../_shared/types.ts';
+import { getServiceClient } from '../_shared/supabase-client.ts';
 
 const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY') ?? '';
 const MAKE_SECRET       = Deno.env.get('MAKE_WEBHOOK_SECRET') ?? '';
@@ -26,101 +21,81 @@ serve(async (req) => {
   const limit: number   = body.limit   ?? 30;
   const segment: string = body.segment ?? '';
 
-  const supabase = createClient();
+  const supabase = getServiceClient();
 
-  // Fetch unenriched leads
   let query = supabase
-    .from('leads')
+    .from('isa_leads')
     .select('*')
     .is('ai_summary', null)
-    .neq('outreach_status', 'dead')
+    .not('outreach_status', 'in', '("dead","closed")')
     .order('created_at', { ascending: true })
     .limit(limit);
 
   if (segment) query = query.eq('segment', segment);
 
-  const { data: leads, error: fetchError } = await query;
-  if (fetchError) return json({ success: false, error: fetchError.message }, 500);
-  if (!leads || leads.length === 0) return json({ success: true, data: { enriched: 0 } });
+  const { data: leads, error } = await query;
+  if (error) return json({ success: false, error: error.message }, 500);
+  if (!leads?.length) return json({ success: true, data: { enriched: 0 } });
 
   let enriched = 0;
   const errors: string[] = [];
 
-  for (const lead of leads as Lead[]) {
+  for (const lead of leads) {
     try {
-      const prompt = buildPrompt(lead);
-      const aiResult = await callClaude(prompt);
-
-      const { bant_score, motivation_score, routing, ai_summary, isa_talking_points } = aiResult;
-
-      const { error: updateError } = await supabase
-        .from('leads')
-        .update({
-          ai_summary,
-          isa_talking_points,
-          bant_score,
-          motivation_score,
-          routing,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', lead.id);
-
-      if (updateError) errors.push(`Update failed for ${lead.id}: ${updateError.message}`);
-      else enriched++;
+      const result = await callClaude(buildPrompt(lead));
+      await supabase.from('isa_leads').update({
+        ai_summary:        result.ai_summary,
+        isa_talking_points: result.isa_talking_points,
+        bant_score:         result.bant_score,
+        motivation_score:   result.motivation_score,
+        routing:            result.routing,
+        updated_at:         new Date().toISOString(),
+      }).eq('id', lead.id);
+      enriched++;
     } catch (err) {
-      errors.push(`Enrichment failed for ${lead.id}: ${(err as Error).message}`);
+      errors.push(`${lead.id}: ${(err as Error).message}`);
     }
   }
 
   return json({ success: true, data: { enriched, errors } });
 });
 
-function buildPrompt(lead: Lead): string {
-  return `You are an expert real estate ISA coach. Analyze this prospect and return a JSON object.
+function buildPrompt(lead: Record<string, unknown>): string {
+  const signals = (lead.motivation_signals as string[] ?? []).join(', ');
+  return `You are an expert NY/NJ real estate ISA coach. Analyze this prospect and return JSON only.
 
-PROSPECT DATA:
-Segment: ${lead.segment}
-Market: ${lead.market}
+PROSPECT:
+Segment: ${lead.segment} | Market: ${lead.market}
 Name: ${lead.full_name ?? lead.entity_name ?? 'Unknown'}
-${lead.team_name    ? `Team: ${lead.team_name}`                    : ''}
-${lead.sport        ? `Sport: ${lead.sport}`                       : ''}
-${lead.contract_value ? `Contract Value: $${lead.contract_value.toLocaleString()}` : ''}
-${lead.employer     ? `Employer: ${lead.employer}`                 : ''}
-${lead.origin_country ? `Origin Country: ${lead.origin_country}`  : ''}
-${lead.production_name ? `Production: ${lead.production_name}`    : ''}
-${lead.property_address ? `Property: ${lead.property_address}`    : ''}
-Motivation Signals: ${JSON.stringify(lead.motivation_signals)}
+${lead.team_name     ? `Team: ${lead.team_name}`                          : ''}
+${lead.sport         ? `Sport: ${lead.sport}`                             : ''}
+${lead.contract_value ? `Contract: $${Number(lead.contract_value).toLocaleString()}` : ''}
+${lead.employer      ? `Employer: ${lead.employer}`                       : ''}
+${lead.origin_country ? `From: ${lead.origin_country}`                   : ''}
+${lead.production_name ? `Production: ${lead.production_name}`            : ''}
+${lead.property_address ? `Property: ${lead.property_address}`           : ''}
+${lead.price_range_min ? `Budget: $${Number(lead.price_range_min).toLocaleString()}–$${Number(lead.price_range_max).toLocaleString()}` : ''}
+Signals: ${signals || 'None captured'}
 Source: ${lead.source_name ?? 'unknown'}
 
-TASK: Return ONLY valid JSON with these exact keys:
+Return ONLY valid JSON:
 {
-  "ai_summary": "<2 sentences: who this is and why they're a real estate prospect right now>",
+  "ai_summary": "<2 sentences: who this is + why they need real estate NOW>",
   "isa_talking_points": [
-    "<talking point 1 — specific, not generic>",
+    "<specific talking point 1 — reference their actual situation>",
     "<talking point 2>",
     "<talking point 3>"
   ],
-  "bant_score": <integer 0-12>,
-  "motivation_score": <integer 1-5>,
+  "bant_score": <0-12>,
+  "motivation_score": <1-5>,
   "routing": "<hot|warm|nurture|cold>"
 }
 
-ROUTING RULES:
-- hot: bant_score >= 9 AND motivation_score >= 4
-- warm: bant_score >= 7 OR motivation_score >= 3
-- nurture: bant_score >= 4
-- cold: everything else
-
-Be specific. Reference the actual person, team, contract, or situation in your talking points.`;
+ROUTING: hot = bant≥9 AND motivation≥4 | warm = bant≥7 OR motivation≥3 | nurture = bant≥4 | cold = else
+Be specific — reference the person's actual team, contract, production, or situation.`;
 }
 
-async function callClaude(prompt: string): Promise<{
-  ai_summary: string;
-  isa_talking_points: string[];
-  bant_score: number;
-  motivation_score: number;
-  routing: LeadRouting;
-}> {
+async function callClaude(prompt: string) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -130,24 +105,19 @@ async function callClaude(prompt: string): Promise<{
     },
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 512,
+      max_tokens: 600,
       messages: [{ role: 'user', content: prompt }],
     }),
   });
-
-  if (!res.ok) throw new Error(`Anthropic API error: ${res.status}`);
-
+  if (!res.ok) throw new Error(`Anthropic ${res.status}`);
   const data = await res.json();
-  const text = data.content[0]?.text ?? '{}';
-
-  // Strip markdown code fences if present
-  const clean = text.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-  return JSON.parse(clean);
+  const text = (data.content[0]?.text ?? '{}')
+    .replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+  return JSON.parse(text);
 }
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
+    status, headers: { 'Content-Type': 'application/json' },
   });
 }
