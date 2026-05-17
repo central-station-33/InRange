@@ -1,6 +1,7 @@
 'use client';
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
+import { createBrowserClient } from '@supabase/ssr';
 
 const nav = [
   { href: '/',          label: 'Pipeline',  icon: '◎' },
@@ -8,7 +9,18 @@ const nav = [
 ];
 
 export function Sidebar() {
-  const path = usePathname();
+  const path   = usePathname();
+  const router = useRouter();
+
+  async function signOut() {
+    const supabase = createBrowserClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    );
+    await supabase.auth.signOut();
+    router.push('/login');
+  }
+
   return (
     <aside className="w-56 bg-gray-900 flex flex-col h-full flex-shrink-0">
       <div className="px-6 py-5 border-b border-gray-700">
@@ -34,8 +46,16 @@ export function Sidebar() {
           );
         })}
       </nav>
-      <div className="px-6 py-4 border-t border-gray-700 text-xs text-gray-500 leading-relaxed">
-        Highline NY<br />Jet Realty Advisors NJ
+      <div className="px-6 py-4 border-t border-gray-700 space-y-3">
+        <div className="text-xs text-gray-500 leading-relaxed">
+          Highline NY<br />Jet Realty Advisors NJ
+        </div>
+        <button
+          onClick={signOut}
+          className="text-xs text-gray-500 hover:text-gray-300 transition-colors w-full text-left"
+        >
+          Sign out →
+        </button>
       </div>
     </aside>
   );

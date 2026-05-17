@@ -49,6 +49,9 @@ export interface FullLead extends PipelineLead {
   first_response_at?: string;
   motivation_signals?: string[];
   raw_data?: Record<string, unknown>;
+  cadence_step?: number;
+  last_cadence_at?: string;
+  cadence_paused?: boolean;
 }
 
 export interface Touch {

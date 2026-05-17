@@ -7,6 +7,53 @@ import { StatusBadge } from '@/components/StatusBadge';
 import { ScoreBar } from '@/components/ScoreBar';
 import { LogTouchForm } from '@/components/LogTouchForm';
 
+const CADENCE_LABELS: Record<number, string> = {
+  0: 'Not started',
+  1: 'Day 1 sent',
+  2: 'Day 3 sent',
+  3: 'Day 7 sent',
+  4: 'Day 14 sent',
+  5: 'Complete (Day 30)',
+};
+
+const CADENCE_NEXT: Record<number, string> = {
+  0: 'First touch fires 1 day after creation',
+  1: 'Next: Day 3 message (2 days from last)',
+  2: 'Next: Day 7 message (4 days from last)',
+  3: 'Next: Day 14 message (7 days from last)',
+  4: 'Next: Day 30 final message (16 days from last)',
+  5: 'Sequence complete',
+};
+
+function CadenceStatus({ step, lastCadenceAt, paused }: { step: number; lastCadenceAt?: string | null; paused: boolean }) {
+  const pct = Math.round((step / 5) * 100);
+  return (
+    <div>
+      {paused && (
+        <div className="text-xs bg-yellow-50 border border-yellow-200 text-yellow-700 rounded-lg px-3 py-2 mb-3">
+          Paused — lead reached terminal status
+        </div>
+      )}
+      <div className="flex justify-between text-xs text-gray-500 mb-1">
+        <span>{CADENCE_LABELS[step] ?? `Step ${step}`}</span>
+        <span>{step}/5</span>
+      </div>
+      <div className="w-full bg-gray-100 rounded-full h-2 mb-2">
+        <div
+          className={`h-2 rounded-full transition-all ${paused ? 'bg-gray-300' : 'bg-indigo-500'}`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <p className="text-xs text-gray-400">{paused ? 'No further messages will be sent' : CADENCE_NEXT[step]}</p>
+      {lastCadenceAt && (
+        <p className="text-xs text-gray-300 mt-1">
+          Last sent {new Date(lastCadenceAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function fmtMoney(n?: number | null) {
   if (!n) return null;
   return `$${Number(n).toLocaleString()}`;
@@ -191,6 +238,15 @@ export default async function LeadDetailPage({ params }: { params: { id: string 
               <ScoreBar label="BANT" value={lead.bant_score} max={12} />
               <ScoreBar label="Motivation" value={lead.motivation_score} max={5} />
             </div>
+          </div>
+
+          <div className="bg-white border border-gray-200 rounded-xl p-5">
+            <h3 className="font-semibold text-gray-900 mb-3">Auto Cadence</h3>
+            <CadenceStatus
+              step={lead.cadence_step ?? 0}
+              lastCadenceAt={lead.last_cadence_at}
+              paused={lead.cadence_paused ?? false}
+            />
           </div>
 
           <LogTouchForm leadId={lead.id} />
