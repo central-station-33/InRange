@@ -65,18 +65,18 @@ serve(async (req) => {
 
 function buildPrompt(lead: Record<string, unknown>): string {
   const signals = (lead.motivation_signals as string[] ?? []).join(', ');
-  return `You are an expert NY/NJ real estate ISA coach. Analyze this prospect and return JSON only.
+  return `Analyze this prospect and return JSON only.
 
 PROSPECT:
 Segment: ${lead.segment} | Market: ${lead.market}
 Name: ${lead.full_name ?? lead.entity_name ?? 'Unknown'}
-${lead.team_name       ? `Team: ${lead.team_name}`                           : ''}
-${lead.sport           ? `Sport: ${lead.sport}`                              : ''}
-${lead.contract_value  ? `Contract: $${Number(lead.contract_value).toLocaleString()}` : ''}
-${lead.employer        ? `Employer: ${lead.employer}`                        : ''}
-${lead.origin_country  ? `From: ${lead.origin_country}`                      : ''}
-${lead.production_name ? `Production: ${lead.production_name}`               : ''}
-${lead.property_address ? `Property: ${lead.property_address}`               : ''}
+${lead.team_name        ? `Team: ${lead.team_name}`                                  : ''}
+${lead.sport            ? `Sport: ${lead.sport}`                                     : ''}
+${lead.contract_value   ? `Contract: $${Number(lead.contract_value).toLocaleString()}` : ''}
+${lead.employer         ? `Employer: ${lead.employer}`                               : ''}
+${lead.origin_country   ? `From: ${lead.origin_country}`                             : ''}
+${lead.production_name  ? `Production: ${lead.production_name}`                      : ''}
+${lead.property_address ? `Property: ${lead.property_address}`                       : ''}
 ${lead.price_range_min  ? `Budget: $${Number(lead.price_range_min).toLocaleString()}–$${Number(lead.price_range_max).toLocaleString()}` : ''}
 Signals: ${signals || 'None captured'}
 Source: ${lead.source_name ?? 'unknown'}
@@ -84,38 +84,77 @@ Source: ${lead.source_name ?? 'unknown'}
 Return ONLY valid JSON:
 {
   "ai_summary": "<2 sentences: who this is + why they need real estate NOW>",
-  "isa_talking_points": [
-    "<specific talking point 1 — reference their actual situation>",
-    "<talking point 2>",
-    "<talking point 3>"
-  ],
+  "isa_talking_points": ["<point 1 — reference actual situation>", "<point 2>", "<point 3>"],
   "bant_score": <0-12>,
   "motivation_score": <1-5>,
   "routing": "<hot|warm|nurture|cold>"
+}`;
 }
 
-ROUTING: hot = bant≥9 AND motivation≥4 | warm = bant≥7 OR motivation≥3 | nurture = bant≥4 | cold = else
-Be specific — reference the person's actual team, contract, production, or situation.`;
-}
+const ENRICH_SYSTEM_PROMPT = `You are an expert NY/NJ real estate ISA coach with deep knowledge of the local market. Analyze real estate prospects and return structured JSON assessments that ISAs use to prioritize and personalize their outreach.
+
+BANT SCORING (0-12, four components 0-3 each):
+- Budget (0-3): 0=unknown, 1=rough range, 2=specific confirmed, 3=pre-approved/verified funds
+- Authority (0-3): 0=unknown, 1=likely decision-maker, 2=confirmed, 3=sole DM with urgency
+- Need (0-3): 0=browsing, 1=general interest, 2=specific criteria, 3=urgent specific need
+- Timing (0-3): 0=no timeline, 1=within 12 months, 2=within 6 months, 3=within 90 days
+
+MOTIVATION SCORE (1-5):
+1=cold/browsing | 2=warm, some signals | 3=engaged, specific questions | 4=hot, clear motivation+timeline | 5=urgent/ready now
+
+ROUTING RULES:
+- hot: bant_score ≥ 9 AND motivation_score ≥ 4
+- warm: bant_score ≥ 7 OR motivation_score ≥ 3
+- nurture: bant_score ≥ 4
+- cold: all other cases
+
+SEGMENT SCORING GUIDANCE:
+- athlete: Contract value = budget. Relocation deadline = timing 3. Always authority 2+.
+- investor: Cash buyers = budget 3. Portfolio size affects need score.
+- motivated_seller: HPD violations/distress = timing 3. Listing price = budget proxy.
+- first_time_buyer: Pre-approval = budget 2-3. Lease expiry/life event = timing boost.
+- divorce: Court-ordered sale = timing 3, authority 2.
+- empty_nester: Home equity = budget. Kids move-out date = timing.
+- developer: Site control timeline = timing. Entitlement stage = need.
+- expat_relocation: Start date = timing. Company relocation package = budget signal.
+- film_tv: Production schedule = timing. Housing stipend = budget signal.
+
+TALKING POINTS RULES:
+- Reference the person's actual situation (team, contract, production, property, employer)
+- Each point must be actionable for an ISA on a phone call
+- Point 1: Lead with their strongest motivation signal
+- Point 2: Address their most likely objection
+- Point 3: Specific next step or discovery question
+
+AI SUMMARY: Exactly 2 sentences. Sentence 1: who they are + specific detail. Sentence 2: why they need real estate NOW (specific urgency signal). Use their name and concrete details.
+
+Return ONLY valid JSON — no markdown, no explanation, no preamble.`;
 
 async function callClaude(prompt: string) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
-      'x-api-key': ANTHROPIC_API_KEY,
+      'x-api-key':        ANTHROPIC_API_KEY,
       'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
+      'anthropic-beta':    'prompt-caching-2024-07-31',
+      'content-type':      'application/json',
     },
     body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
+      model:      'claude-sonnet-4-6',
       max_tokens: 600,
+      system: [
+        {
+          type:          'text',
+          text:          ENRICH_SYSTEM_PROMPT,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
       messages: [{ role: 'user', content: prompt }],
     }),
   });
   if (!res.ok) throw new Error(`Anthropic ${res.status}`);
   const data = await res.json();
   const raw  = (data.content[0]?.text ?? '{}');
-  // Robustly extract JSON — strip markdown fences then find first { ... } block.
   const stripped = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
   const start    = stripped.indexOf('{');
   const end      = stripped.lastIndexOf('}');

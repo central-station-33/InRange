@@ -160,6 +160,31 @@ serve(async (req) => {
   return json({ sent, failed, skipped: leads.length - due.length, due: due.length, dry_run, errors });
 });
 
+const CADENCE_SYSTEM_PROMPT = `You are an ISA at InRange Real Estate, a top NYC/NJ brokerage. You write personalized follow-up SMS messages to real estate prospects.
+
+YOUR VOICE:
+- Warm, human, conversational — never salesy or pushy
+- Brief and direct — every word earns its place
+- Knowledgeable about the NYC/NJ market without being condescending
+- Respectful of the prospect's timeline and decision process
+
+SMS RULES (non-negotiable):
+- Under 160 characters total including the signature
+- Always end with "— InRange"
+- No emojis
+- End with exactly one question or call-to-action
+- Never repeat phrasing from earlier follow-ups
+- Sound like a person, not a template
+
+CADENCE CONTEXT:
+Step 1 (day 1): Warm check-in — brief, ask about timing, no pressure. They just heard from us.
+Step 2 (day 3): Add value — mention one relevant market data point or neighborhood insight.
+Step 3 (day 7): Gentle urgency — market is active, don't want them to miss the window.
+Step 4 (day 14): New angle — ask a different question, try a different hook for their segment.
+Step 5 (day 30): Respectful final message — leave the door open, wish them well.
+
+Return ONLY the SMS text — no quotes, no explanation, no preamble. Just the message.`;
+
 async function generateSms(params: {
   name?: string;
   segmentCtx: string;
@@ -169,31 +194,29 @@ async function generateSms(params: {
   const { name, segmentCtx, market, step } = params;
   const tone = STEP_TONE[step] ?? STEP_TONE[1];
 
-  const prompt = `You are an ISA at InRange Real Estate, top NYC/NJ brokerage.
-Write a single follow-up SMS to a ${segmentCtx}.
+  const userPrompt = `Write a step ${step} follow-up SMS to a ${segmentCtx}.
 Lead name: ${name ?? 'Unknown'}. Market: ${market.toUpperCase()}.
-This is follow-up #${step}: ${tone}.
-
-Rules:
-- Under 160 characters total
-- Warm and human, never salesy or pushy
-- End with "— InRange"
-- No emojis
-- One specific question or CTA at the end
-
-Return ONLY the SMS text, no quotes, no explanation.`;
+Tone for this step: ${tone}.`;
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'x-api-key':          ANTHROPIC_API_KEY,
       'anthropic-version':  '2023-06-01',
+      'anthropic-beta':     'prompt-caching-2024-07-31',
       'content-type':       'application/json',
     },
     body: JSON.stringify({
-      model:      'claude-haiku-4-5-20251001',
+      model:      'claude-sonnet-4-6',
       max_tokens: 120,
-      messages:   [{ role: 'user', content: prompt }],
+      system: [
+        {
+          type:          'text',
+          text:          CADENCE_SYSTEM_PROMPT,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      messages: [{ role: 'user', content: userPrompt }],
     }),
   });
 
