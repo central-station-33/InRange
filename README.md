@@ -7,19 +7,22 @@ using only free/open data sources and the existing InRange infrastructure stack.
 
 ```
 Make.com Scenarios (us2.make.com)
-  │  scheduled triggers + orchestration
+  │  scheduled triggers + Apify actor runs + orchestration
+  ▼
+Apify Store Actors
+  │  ESPN transactions · Zillow · StreetEasy · LinkedIn · RAG browser
   ▼
 Supabase Edge Functions (Deno/TypeScript)
-  │  ingest → score → enrich → notify
+  │  ingest → score/qualify → enrich (Claude) → notify
   ▼
 Supabase PostgreSQL
-  │  properties, scores, subscribers, notifications
+  │  properties · scores · leads · lead_touches · subscribers
   ▼
 Retool Dashboard
-     live tables, filters, lead management
+     property pipeline · ISA lead board · outreach tracker
 ```
 
-## Pipeline Steps
+## Property Pipeline (Distressed Investor Leads)
 
 | Step | Function | Trigger | Description |
 |---|---|---|---|
@@ -28,6 +31,33 @@ Retool Dashboard
 | 3 | `score-properties` | After each ingest | Composite 0–100 score, Tier 1–4 classification |
 | 4 | `enrich-ai` | Daily 6 AM ET | Claude AI investment memo for Tier 1–2 properties |
 | 5 | `notify-subscribers` | Daily 7 AM ET | Delivers leads via webhook / Make.com routing |
+
+## ISA Lead Pipeline (People-Centric Prospect Engine)
+
+| Step | Function | Trigger | Description |
+|---|---|---|---|
+| 6 | `ingest-leads` | Daily 4 AM ET (via Make+Apify) | Athletes: ESPN transactions for all NY/NJ teams |
+| 7 | `ingest-leads` | Daily 4:30 AM ET | Motivated sellers: Zillow 60+ DOM + off-market NYC |
+| 8 | `ingest-leads` | Daily 4:35 AM ET | Motivated sellers: Zillow NJ |
+| 9 | `ingest-leads` | Weekly Mon 5 AM ET | Film/TV: NYC MOME permits + LinkedIn housing coordinators |
+| 10 | `ingest-leads` | Weekly Mon 5:30 AM ET | Expat/relocation: corporate news + LinkedIn HR contacts |
+| 11 | `enrich-leads` | Daily 6:30 AM ET | Claude BANT scoring + ISA talking points for all new leads |
+| 12 | `notify-isa` | Daily 7:30 AM ET | Hot leads → assigned ISA via SMS + email |
+| 13 | `notify-isa` | Daily 8 AM ET | Warm leads → Slack #isa-leads for team to claim |
+
+### Lead Segments
+
+| Segment | Primary Data Source | Contact Method |
+|---|---|---|
+| `athlete` | ESPN + Spotrac | Sports agent (phone/email) |
+| `motivated_seller` | Zillow + StreetEasy + ACRIS | Owner direct (phone) |
+| `film_tv` | NYC MOME permits + LinkedIn | Housing coordinator (LinkedIn/email) |
+| `expat_relocation` | PR Newswire + LinkedIn | HR/relocation coordinator |
+| `investor` | ACRIS cash deeds + BiggerPockets | Direct or LinkedIn |
+| `divorce` | NYSCEF + NJ Courts | Attorney referral |
+| `empty_nester` | Public records + social signals | Owner direct |
+| `first_time_buyer` | Reddit + forum signals + events | Direct |
+| `developer` | NYC DOB COs + unsold inventory | Developer principal |
 
 ## Scoring Model
 
@@ -90,6 +120,8 @@ ANTHROPIC_API_KEY       = sk-ant-...
 NYC_OPEN_DATA_APP_TOKEN = (optional, raises rate limits)
 MAKE_WEBHOOK_SECRET     = (shared secret for Make.com auth)
 MAKE_NOTIFY_WEBHOOK     = https://hook.us2.make.com/...
+MAKE_ISA_WEBHOOK        = https://hook.us2.make.com/...  (ISA notifications router)
+APIFY_API_TOKEN         = apify_api_...
 ```
 
 ### 2. Make.com
@@ -107,9 +139,11 @@ Key views to expose in Retool tables:
 | Retool Table | Supabase View |
 |---|---|
 | Pipeline Summary | `pipeline_summary` |
-| All Leads | `leads_dashboard` |
+| All Property Leads | `leads_dashboard` |
 | Tier 1 Leads | `leads_dashboard` (filter: tier = 1) |
 | Ingestion Logs | `ingestion_runs` |
+| ISA Lead Board | `isa_leads_dashboard` |
+| ISA Pipeline Summary | `isa_pipeline_summary` |
 
 ## Data Sources
 
