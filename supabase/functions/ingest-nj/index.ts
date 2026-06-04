@@ -74,10 +74,9 @@ async function fetchModIV(
   });
 }
 
-// Target NJ counties (expand as needed)
+// Target NJ counties
 const TARGET_COUNTIES = [
-  'HUDSON', 'ESSEX', 'PASSAIC', 'UNION', 'MIDDLESEX',
-  'BERGEN', 'CAMDEN', 'MERCER',
+  'BERGEN', 'HUDSON', 'ESSEX', 'MORRIS', 'SUSSEX',
 ];
 
 // ─── Parse: Sheriff sales pushed from Make.com ────────────────────────────────
