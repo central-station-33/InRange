@@ -1,0 +1,107 @@
+{
+  "markets": {
+    "nyc": {
+      "label": "NYC Metro",
+      "state": "NY",
+      "timezone": "America/New_York",
+      "linkedin_geo_urn": "102571732",
+      "sms_area": "NYC & NJ",
+      "sports_teams": [
+        { "sport": "NBA",  "team": "New York Knicks",   "espn_team_id": "18",  "league": "nba" },
+        { "sport": "NBA",  "team": "Brooklyn Nets",     "espn_team_id": "17",  "league": "nba" },
+        { "sport": "NFL",  "team": "New York Giants",   "espn_team_id": "19",  "league": "nfl" },
+        { "sport": "NFL",  "team": "New York Jets",     "espn_team_id": "20",  "league": "nfl" },
+        { "sport": "MLB",  "team": "New York Yankees",  "espn_team_id": "10",  "league": "mlb" },
+        { "sport": "MLB",  "team": "New York Mets",     "espn_team_id": "21",  "league": "mlb" },
+        { "sport": "NHL",  "team": "New York Rangers",  "espn_team_id": "3",   "league": "nhl" },
+        { "sport": "MLS",  "team": "NYCFC",             "espn_team_id": "18358","league": "mls" }
+      ],
+      "data_sources": {
+        "property_transfers": {
+          "url": "https://data.cityofnewyork.us/resource/636b-3b5g.json",
+          "description": "NYC ACRIS cash deed transfers"
+        },
+        "building_permits": {
+          "url": "https://data.cityofnewyork.us/resource/ipu4-2q9a.json",
+          "description": "NYC DOB building permits (developer segment)"
+        },
+        "film_permits": {
+          "url": "https://data.cityofnewyork.us/resource/tg4x-b46p.json",
+          "description": "NYC MOME film/TV production permits"
+        },
+        "hpd_violations": {
+          "url": "https://data.cityofnewyork.us/resource/wvxf-dwi5.json",
+          "description": "NYC HPD code violations (distressed sellers)"
+        }
+      },
+      "price_benchmarks": {
+        "median_condo_manhattan": 1250000,
+        "median_condo_brooklyn":  850000,
+        "median_sfh_queens":      750000,
+        "avg_rent_1br_manhattan": 4200
+      }
+    },
+
+    "nj": {
+      "label": "New Jersey",
+      "state": "NJ",
+      "timezone": "America/New_York",
+      "linkedin_geo_urn": "105763813",
+      "sms_area": "NJ",
+      "sports_teams": [
+        { "sport": "NHL", "team": "New Jersey Devils",  "espn_team_id": "1",   "league": "nhl" },
+        { "sport": "MLS", "team": "NY Red Bulls",       "espn_team_id": "254", "league": "mls" }
+      ],
+      "target_counties": ["Bergen", "Hudson", "Essex", "Morris", "Sussex"],
+      "data_sources": {
+        "tax_records": {
+          "url": "https://data.nj.gov/resource/9t3z-m4ac.json",
+          "description": "NJ property tax records"
+        },
+        "building_permits": {
+          "url": "https://data.nj.gov/resource/permits",
+          "description": "NJ municipal building permits"
+        }
+      },
+      "price_benchmarks": {
+        "median_sfh_bergen":   725000,
+        "median_sfh_hudson":   650000,
+        "median_sfh_essex":    575000,
+        "avg_rent_1br_jersey_city": 3100
+      }
+    }
+  },
+
+  "segments": {
+    "athlete":          { "label": "Athlete",           "icon": "🏆", "typical_budget_min": 1500000 },
+    "investor":         { "label": "Investor",          "icon": "📈", "typical_budget_min": 500000  },
+    "motivated_seller": { "label": "Motivated Seller",  "icon": "🏠", "typical_budget_min": null    },
+    "first_time_buyer": { "label": "First-Time Buyer",  "icon": "🔑", "typical_budget_min": 300000  },
+    "divorce":          { "label": "Divorce / Transition","icon": "⚖️","typical_budget_min": null    },
+    "empty_nester":     { "label": "Empty Nester",      "icon": "🏡", "typical_budget_min": 600000  },
+    "developer":        { "label": "Developer",         "icon": "🏗️", "typical_budget_min": 1000000 },
+    "expat_relocation": { "label": "Expat / Relocation","icon": "✈️", "typical_budget_min": 800000  },
+    "film_tv":          { "label": "Film / TV",         "icon": "🎬", "typical_budget_min": 400000  }
+  },
+
+  "_template_instructions": {
+    "to_add_a_new_market": [
+      "1. Copy one of the market blocks above (e.g. 'nyc') and rename the key (e.g. 'miami')",
+      "2. Update linkedin_geo_urn — find yours at linkedin.com/jobs/search then inspect the geoId param",
+      "3. Replace sports_teams with teams in your market (ESPN team IDs at espn.com/[sport]/teams)",
+      "4. Replace data_sources with your city/county open data APIs",
+      "5. Update price_benchmarks with local comps",
+      "6. In Make.com: clone S14/S15 (LinkedIn search), update geoUrn and market param to your new key",
+      "7. In Make.com: clone S1/S5 (ESPN athletes), update team IDs",
+      "8. In Supabase isa_leads: the 'market' column accepts any string — just use your new key"
+    ],
+    "cost_to_operate_per_market": {
+      "supabase": "$0 (shared project)",
+      "make_operations_per_day": "~200 ops for daily prospecting runs",
+      "apify_per_month": "$5-15 depending on scraping volume",
+      "twilio_per_lead_sms": "$0.0079",
+      "claude_per_lead_enrichment": "$0.01-0.05",
+      "total_estimate_per_month": "$30-75 per active market"
+    }
+  }
+}
