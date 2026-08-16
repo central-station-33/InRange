@@ -3,6 +3,11 @@
 Finds, scores, and delivers distressed real estate leads in **New York** and **New Jersey**
 using only free/open data sources and the existing InRange infrastructure stack.
 
+> **Also in this repo:** [Finance Agents](docs/finance-agents.md) — AI agents that analyze
+> personal and business finances and propose debt payoff / business-credit-building plans,
+> gated behind human approval. Separate `finance` Postgres schema and `finance-*` edge
+> functions; doesn't touch anything below this line.
+
 ## Architecture
 
 ```
