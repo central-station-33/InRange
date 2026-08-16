@@ -9,11 +9,15 @@ export function getServiceClient() {
   });
 }
 
-export function verifyMakeSecret(req: Request): void {
-  const secret = Deno.env.get('MAKE_WEBHOOK_SECRET');
+export function verifySecret(req: Request, envVar: string, header: string): void {
+  const secret = Deno.env.get(envVar);
   if (!secret) return; // no secret configured — allow (dev mode)
-  const provided = req.headers.get('x-make-secret');
-  if (provided !== secret) throw new Error('Unauthorized: invalid Make.com secret');
+  const provided = req.headers.get(header);
+  if (provided !== secret) throw new Error(`Unauthorized: invalid ${header}`);
+}
+
+export function verifyMakeSecret(req: Request): void {
+  verifySecret(req, 'MAKE_WEBHOOK_SECRET', 'x-make-secret');
 }
 
 export function jsonResponse(body: unknown, status = 200): Response {
