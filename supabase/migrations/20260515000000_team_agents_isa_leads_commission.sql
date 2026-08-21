@@ -120,7 +120,20 @@ CREATE TABLE IF NOT EXISTS lead_touches (
 
 CREATE INDEX IF NOT EXISTS idx_lead_touches_lead ON lead_touches(lead_id);
 
--- ─── Update deals table with commission tracking ──────────────────────────────
+-- ─── Deals table ─────────────────────────────────────────────────────────────
+-- Create the base table if it doesn't exist yet (no earlier migration does this).
+-- The ALTER TABLE block below then adds commission columns idempotently.
+
+CREATE TABLE IF NOT EXISTS deals (
+  id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  status     TEXT        NOT NULL DEFAULT 'active'
+                         CHECK (status IN ('active', 'pending', 'closed', 'cancelled')),
+  close_date DATE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ─── Add commission columns to deals ─────────────────────────────────────────
 
 ALTER TABLE deals
   ADD COLUMN IF NOT EXISTS assigned_agent_id    UUID REFERENCES team_agents(id) ON DELETE SET NULL,
