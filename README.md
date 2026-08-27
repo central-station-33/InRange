@@ -66,9 +66,13 @@ supabase/
     score-properties/index.ts       # Composite scoring engine
     enrich-ai/index.ts              # Claude API enrichment
     notify-subscribers/index.ts     # Subscriber notification delivery
+    complaint-intake/index.ts       # BT Capital complaint form intake + validation
+    complaint-escalation-check/index.ts  # FINRA 30-day clock alerts + retention housekeeping
+    complaint-quarterly-report/index.ts  # FINRA Gateway quarterly summary report
 docs/
   make-scenarios.md                 # Make.com scenario blueprints
   data-sources.md                   # Data source reference + field mapping
+  complaints-platform.md            # BT Capital investor complaint platform (independent module)
 .env.example                        # Required environment variables
 ```
 
@@ -129,3 +133,22 @@ curl -X POST http://localhost:54321/functions/v1/ingest-nyc \
   -H "Content-Type: application/json" \
   -d '{}'
 ```
+
+## BT Capital — Investor Complaint Platform
+
+An independent module on the same stack: a FINRA Rule 4513/4530-style
+complaint intake, escalation, and quarterly-reporting system for a
+FINRA-registered Reg CF funding portal. It does not interact with the
+property lead-gen tables above.
+
+```
+WordPress/Elementor Form → Make.com → Supabase Edge Functions → PostgreSQL → Retool
+```
+
+- **Schema:** `supabase/migrations/20260827000000_complaints_schema.sql`,
+  `20260827000001_complaints_views.sql`
+- **Functions:** `complaint-intake`, `complaint-escalation-check`, `complaint-quarterly-report`
+- **Docs:** `docs/complaints-platform.md` — form field mapping, Make.com
+  scenario blueprints, Retool views, and required environment variables
+
+See `docs/complaints-platform.md` for the full build spec.
