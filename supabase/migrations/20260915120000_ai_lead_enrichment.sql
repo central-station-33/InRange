@@ -107,16 +107,54 @@ CREATE TABLE ai_enrichment_runs (
   created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
+-- Audit-log guard: DELETE is never permitted. UPDATE is permitted only to
+-- record a human review sign-off (reviewed_by, flagged_for_review) — every
+-- other column, including the model output itself, is immutable once
+-- written. Fires regardless of role, including the service-role key.
+CREATE OR REPLACE FUNCTION prevent_ai_run_mutation()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'ai_enrichment_runs is an audit log: DELETE is not permitted on id=%.', OLD.id;
+  END IF;
+
+  IF NEW.lead_id            IS DISTINCT FROM OLD.lead_id
+     OR NEW.model            IS DISTINCT FROM OLD.model
+     OR NEW.run_type         IS DISTINCT FROM OLD.run_type
+     OR NEW.input_ref        IS DISTINCT FROM OLD.input_ref
+     OR NEW.output           IS DISTINCT FROM OLD.output
+     OR NEW.confidence_score IS DISTINCT FROM OLD.confidence_score
+     OR NEW.created_at       IS DISTINCT FROM OLD.created_at
+  THEN
+    RAISE EXCEPTION
+      'ai_enrichment_runs is an audit log: only reviewed_by and flagged_for_review may change on id=%.', OLD.id;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_ai_enrichment_runs_guard
+  BEFORE UPDATE OR DELETE ON ai_enrichment_runs
+  FOR EACH ROW EXECUTE FUNCTION prevent_ai_run_mutation();
+
 -- Provenance ledger: every fact attached to a lead, with its own source and
 -- confidence. This is what makes "confirmed" vs. "needs verification"
 -- queryable instead of implicit in prose.
 --
--- Rows here are append-only from application code: a correction is a new
--- row, never an UPDATE/DELETE of an existing one (see §9 of the blueprint
--- doc — "reversible without deleting original evidence"). Only the
--- service-role key can write to this table at all (see RLS below), so
--- that invariant is enforced by which code paths exist, not by a DB
--- trigger; Edge Function code must not issue UPDATE/DELETE against it.
+-- Rows here are append-only, enforced below by trg_lead_evidence_immutable
+-- (a BEFORE UPDATE OR DELETE trigger, not just an application-code
+-- convention — it fires regardless of role, including the service-role
+-- key, so a bug in Edge Function code cannot mutate or delete a row). A
+-- verification or correction is a NEW row with `supersedes_id` pointing at
+-- the row it confirms/corrects; the original stays exactly as written,
+-- satisfying "reversible without deleting original evidence" as a DB
+-- guarantee rather than a documented convention.
+--
+-- Because rows can never be updated in place, verified_by/verified_at are
+-- set at INSERT time only: they describe a row that itself represents a
+-- human verification action (source_type = 'agent_input', confidence =
+-- 'confirmed'), not a later sign-off bolted onto an AI-authored row.
 CREATE TABLE lead_evidence (
   id             UUID                   PRIMARY KEY DEFAULT gen_random_uuid(),
   lead_id        UUID                   NOT NULL REFERENCES lead_records(id) ON DELETE CASCADE,
@@ -127,12 +165,26 @@ CREATE TABLE lead_evidence (
   source_detail  TEXT,                              -- dataset name, document ID, or agent note
   extracted_by   TEXT,                              -- 'gemini', 'claude', 'rule_engine', or an agent identifier — descriptive only, not the audit link
   ai_run_id      UUID                   REFERENCES ai_enrichment_runs(id),  -- REQUIRED (see CHECK below) whenever source_type = 'ai_extraction'; the actual audit link
+  supersedes_id  UUID                   REFERENCES lead_evidence(id),       -- set when this row verifies or corrects an earlier row for the same field_name
   verified_by    UUID                   REFERENCES auth.users(id),
   verified_at    TIMESTAMPTZ,
   created_at     TIMESTAMPTZ            NOT NULL DEFAULT NOW(),
   CONSTRAINT ai_evidence_must_link_to_run
     CHECK (source_type <> 'ai_extraction' OR ai_run_id IS NOT NULL)
 );
+
+CREATE OR REPLACE FUNCTION prevent_lead_evidence_mutation()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION
+    'lead_evidence is append-only: % is not permitted on id=%. Insert a new row with supersedes_id set instead.',
+    TG_OP, OLD.id;
+END;
+$$;
+
+CREATE TRIGGER trg_lead_evidence_immutable
+  BEFORE UPDATE OR DELETE ON lead_evidence
+  FOR EACH ROW EXECUTE FUNCTION prevent_lead_evidence_mutation();
 
 -- Skip-traced or agent-supplied contact info. Kept separate from
 -- lead_evidence because contacts carry their own compliance flags.
@@ -178,6 +230,7 @@ CREATE INDEX idx_lead_records_category        ON lead_records(category);
 CREATE INDEX idx_lead_records_assigned_agent  ON lead_records(assigned_agent_id);
 CREATE INDEX idx_lead_evidence_lead           ON lead_evidence(lead_id);
 CREATE INDEX idx_lead_evidence_ai_run         ON lead_evidence(ai_run_id) WHERE ai_run_id IS NOT NULL;
+CREATE INDEX idx_lead_evidence_supersedes     ON lead_evidence(supersedes_id) WHERE supersedes_id IS NOT NULL;
 CREATE INDEX idx_lead_evidence_confidence     ON lead_evidence(confidence);
 CREATE INDEX idx_ai_enrichment_runs_lead      ON ai_enrichment_runs(lead_id);
 CREATE INDEX idx_ai_enrichment_runs_flagged   ON ai_enrichment_runs(flagged_for_review) WHERE flagged_for_review;
@@ -219,6 +272,13 @@ CREATE POLICY "auth read compliance_playbook"
 -- and its resolved compliance action. This is the read model an agent
 -- workbench (Retool or CRM UI) should query — never lead_evidence directly,
 -- so confirmed/unverified stays visually distinct at the source.
+--
+-- Fact counts below only count "current" evidence — rows that are not
+-- referenced by some later row's supersedes_id. Because lead_evidence is
+-- append-only (see trg_lead_evidence_immutable), a verified or corrected
+-- fact exists as two rows (the original plus the row that supersedes it);
+-- counting both would double-count and misrepresent how much of a lead is
+-- actually still unverified.
 CREATE OR REPLACE VIEW lead_workbench AS
 SELECT
   lr.id                    AS lead_id,
@@ -242,10 +302,12 @@ SELECT
   (
     SELECT COUNT(*) FROM lead_evidence le
     WHERE le.lead_id = lr.id AND le.confidence = 'confirmed'
+      AND NOT EXISTS (SELECT 1 FROM lead_evidence le2 WHERE le2.supersedes_id = le.id)
   ) AS confirmed_fact_count,
   (
     SELECT COUNT(*) FROM lead_evidence le
     WHERE le.lead_id = lr.id AND le.confidence IN ('ai_inferred', 'unverified')
+      AND NOT EXISTS (SELECT 1 FROM lead_evidence le2 WHERE le2.supersedes_id = le.id)
   ) AS unverified_fact_count,
   lr.created_at,
   lr.updated_at

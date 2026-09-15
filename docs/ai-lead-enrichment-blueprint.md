@@ -153,8 +153,13 @@ See `supabase/migrations/20260915120000_ai_lead_enrichment.sql`. Summary:
   enum (`confirmed`, `ai_inferred`, `unverified`), `source_type`
   (`public_record`, `vendor_feed`, `ai_extraction`, `skip_trace`,
   `agent_input`), `source_detail` (free text citation — dataset name, doc
-  ID, or agent note), optional `verified_by` / `verified_at` for the human
-  sign-off path.
+  ID, or agent note). Rows are immutable — enforced by a `BEFORE UPDATE OR
+  DELETE` trigger, not just convention (see §9) — so a human verifying or
+  correcting an AI-inferred fact is a new row with `supersedes_id` pointing
+  at the one it confirms/corrects, `verified_by`/`verified_at` set at that
+  row's insert time. `lead_workbench`'s fact counts only count rows nothing
+  else supersedes, so a verified fact isn't double-counted as both
+  confirmed and unverified.
 - `ai_enrichment_runs` — audit log of every Gemini/Claude call: model,
   run_type, input reference, raw output, confidence_score,
   flagged_for_review.
@@ -273,18 +278,25 @@ change, listed first; the rest apply once Phase 1+ code is written.
   only had `extracted_by TEXT` (a free-text label like `'gemini'`) — that
   was a real gap against "linked to an enrichment run," not just a
   wording issue, and is fixed in this revision.
-- **Reversible without deleting original evidence.** `lead_evidence` rows
-  are append-only by convention: a correction is a new row, never an
-  `UPDATE`/`DELETE` of an existing one. This is enforced today by access
-  control, not a database trigger — the RLS policies below grant
-  `authenticated` `SELECT` only on `lead_evidence` and
-  `ai_enrichment_runs` (no `UPDATE`/`DELETE`), so only the service-role
-  key (used exclusively by Edge Functions) can write at all. That means
-  the guarantee currently depends on Edge Function code never issuing an
-  `UPDATE`/`DELETE` against these tables — worth revisiting with an
-  actual `BEFORE UPDATE OR DELETE` trigger that rejects the statement if
-  this ever needs to be airtight against a bug in that code, rather than
-  just a documented convention.
+- **Reversible without deleting original evidence — DB-enforced, not just
+  a convention.** `lead_evidence` has a `BEFORE UPDATE OR DELETE` trigger
+  (`trg_lead_evidence_immutable`) that unconditionally raises an exception,
+  and it fires for every role — including the service-role key Edge
+  Functions use, which bypasses RLS but not triggers. So a bug in Edge
+  Function code that tried to `UPDATE` or `DELETE` a row would fail loudly
+  at the database, not silently corrupt the audit trail. Correcting or
+  verifying a fact is a new row with `supersedes_id` pointing at the one it
+  replaces (§2, §4); the original is never touched. `ai_enrichment_runs`
+  has the equivalent guard (`trg_ai_enrichment_runs_guard`): `DELETE` is
+  always rejected, and `UPDATE` is rejected unless the only columns
+  changing are `reviewed_by`/`flagged_for_review` — the model, its output,
+  and everything else about a run are immutable once logged. Verified
+  against a local Postgres instance: a direct `UPDATE`/`DELETE` on
+  `lead_evidence` fails, inserting a `supersedes_id` row succeeds and the
+  original row is untouched, `lead_workbench`'s counts correctly treat the
+  superseded row as not-current, an `ai_enrichment_runs` update touching
+  only `reviewed_by`/`flagged_for_review` succeeds, and an update touching
+  `output` (or any other column) and a `DELETE` both fail.
 - **Never overwrite raw source data with model output.** `properties` and
   `properties.raw_data` are untouched by this migration; `lead_evidence`
   is an entirely separate table, so there's no code path by which
