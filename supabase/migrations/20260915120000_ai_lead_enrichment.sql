@@ -84,9 +84,39 @@ CREATE TRIGGER trg_lead_records_updated_at
   BEFORE UPDATE ON lead_records
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+-- Audit log of every Gemini/Claude enrichment call. Kept even when a
+-- second-pass review supersedes a primary extraction — the reviewer's
+-- verdict wins for display, but the original run stays for auditing.
+-- Created before lead_evidence so evidence rows can hold a real FK back to
+-- the run that produced them, not just a free-text model-name label.
+--
+-- input_ref/output must never contain lead_contacts values (phone, email,
+-- mailing address) or any other raw consumer contact data — only what was
+-- actually necessary for classification (property + score + public raw_data).
+-- See docs/ai-lead-enrichment-blueprint.md §9 (Security & Data Handling).
+CREATE TABLE ai_enrichment_runs (
+  id                 UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  lead_id            UUID         NOT NULL REFERENCES lead_records(id) ON DELETE CASCADE,
+  model              TEXT         NOT NULL,   -- e.g. 'gemini-2.5-pro', 'claude-sonnet-4-6'
+  run_type           ai_run_type  NOT NULL,
+  input_ref          JSONB        NOT NULL DEFAULT '{}',  -- pointer to what the model saw (property_id, raw_data snapshot ref, etc.) — never contact data
+  output             JSONB        NOT NULL DEFAULT '{}',  -- raw model output
+  confidence_score   NUMERIC      CHECK (confidence_score BETWEEN 0 AND 1),
+  flagged_for_review BOOLEAN      NOT NULL DEFAULT FALSE,
+  reviewed_by        UUID         REFERENCES auth.users(id),
+  created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
 -- Provenance ledger: every fact attached to a lead, with its own source and
 -- confidence. This is what makes "confirmed" vs. "needs verification"
 -- queryable instead of implicit in prose.
+--
+-- Rows here are append-only from application code: a correction is a new
+-- row, never an UPDATE/DELETE of an existing one (see §9 of the blueprint
+-- doc — "reversible without deleting original evidence"). Only the
+-- service-role key can write to this table at all (see RLS below), so
+-- that invariant is enforced by which code paths exist, not by a DB
+-- trigger; Edge Function code must not issue UPDATE/DELETE against it.
 CREATE TABLE lead_evidence (
   id             UUID                   PRIMARY KEY DEFAULT gen_random_uuid(),
   lead_id        UUID                   NOT NULL REFERENCES lead_records(id) ON DELETE CASCADE,
@@ -95,26 +125,13 @@ CREATE TABLE lead_evidence (
   confidence     evidence_confidence    NOT NULL,
   source_type    evidence_source_type   NOT NULL,
   source_detail  TEXT,                              -- dataset name, document ID, or agent note
-  extracted_by   TEXT,                              -- 'gemini', 'claude', 'rule_engine', or an agent identifier
+  extracted_by   TEXT,                              -- 'gemini', 'claude', 'rule_engine', or an agent identifier — descriptive only, not the audit link
+  ai_run_id      UUID                   REFERENCES ai_enrichment_runs(id),  -- REQUIRED (see CHECK below) whenever source_type = 'ai_extraction'; the actual audit link
   verified_by    UUID                   REFERENCES auth.users(id),
   verified_at    TIMESTAMPTZ,
-  created_at     TIMESTAMPTZ            NOT NULL DEFAULT NOW()
-);
-
--- Audit log of every Gemini/Claude enrichment call. Kept even when a
--- second-pass review supersedes a primary extraction — the reviewer's
--- verdict wins for display, but the original run stays for auditing.
-CREATE TABLE ai_enrichment_runs (
-  id                 UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-  lead_id            UUID         NOT NULL REFERENCES lead_records(id) ON DELETE CASCADE,
-  model              TEXT         NOT NULL,   -- e.g. 'gemini-2.5-pro', 'claude-sonnet-4-6'
-  run_type           ai_run_type  NOT NULL,
-  input_ref          JSONB        NOT NULL DEFAULT '{}',  -- pointer to what the model saw (property_id, raw_data snapshot ref, etc.)
-  output             JSONB        NOT NULL DEFAULT '{}',  -- raw model output
-  confidence_score   NUMERIC      CHECK (confidence_score BETWEEN 0 AND 1),
-  flagged_for_review BOOLEAN      NOT NULL DEFAULT FALSE,
-  reviewed_by        UUID         REFERENCES auth.users(id),
-  created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+  created_at     TIMESTAMPTZ            NOT NULL DEFAULT NOW(),
+  CONSTRAINT ai_evidence_must_link_to_run
+    CHECK (source_type <> 'ai_extraction' OR ai_run_id IS NOT NULL)
 );
 
 -- Skip-traced or agent-supplied contact info. Kept separate from
@@ -160,6 +177,7 @@ CREATE INDEX idx_lead_records_status          ON lead_records(status);
 CREATE INDEX idx_lead_records_category        ON lead_records(category);
 CREATE INDEX idx_lead_records_assigned_agent  ON lead_records(assigned_agent_id);
 CREATE INDEX idx_lead_evidence_lead           ON lead_evidence(lead_id);
+CREATE INDEX idx_lead_evidence_ai_run         ON lead_evidence(ai_run_id) WHERE ai_run_id IS NOT NULL;
 CREATE INDEX idx_lead_evidence_confidence     ON lead_evidence(confidence);
 CREATE INDEX idx_ai_enrichment_runs_lead      ON ai_enrichment_runs(lead_id);
 CREATE INDEX idx_ai_enrichment_runs_flagged   ON ai_enrichment_runs(flagged_for_review) WHERE flagged_for_review;

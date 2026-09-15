@@ -205,8 +205,10 @@ drives outreach:
 ## 6. What this doc does NOT do
 
 - It does not add a Gemini or Vercel dependency to this repo. No SDK, no
-  `GEMINI_API_KEY` reference, no `vercel.json` — those land when Phase 2 is
-  approved (see below).
+  live `GEMINI_API_KEY`, no `vercel.json` — those land when Phase 1
+  (Gemini) and the CRM-UI open decision (Vercel, see §8) are approved.
+  (`.env.example` documents `GEMINI_API_KEY` as reserved-but-unset, per
+  §9, so it's clear what Phase 1 will need without wiring it up early.)
 - It does not modify `ingest-nyc`, `ingest-nj`, `score-properties`, or the
   existing `enrich-ai` function. The current pipeline keeps running
   unchanged; `lead_records` is populated by a new, separate function once
@@ -248,3 +250,70 @@ drives outreach:
   Retool view contract in the README.
 - Final compliance-playbook content, from counsel, per category and per
   state (NY vs. NJ differ materially on foreclosure-related solicitation).
+
+## 9. Security & Data Handling (non-negotiable)
+
+These rules govern every phase of this blueprint, not just future ones.
+Two of them are already enforced in the Phase 0 schema shipped in this
+change, listed first; the rest apply once Phase 1+ code is written.
+
+### Already enforced in Phase 0
+
+- **No secrets in source.** This repo had no `.gitignore` before this
+  change — nothing stopped a real `.env` from being committed. Added one
+  that excludes `.env`/`.env.*` (keeping `.env.example`). Verified no real
+  key is currently committed anywhere in the repo (checked the tracked
+  `.env.example` and the three Make.com blueprint JSON exports — all
+  contain only the literal placeholder `YOUR_SUPABASE_SERVICE_ROLE_KEY`,
+  not a real key).
+- **AI-derived fields are auditable and linked to a specific run.**
+  `lead_evidence.ai_run_id` is a real foreign key to `ai_enrichment_runs`,
+  enforced by a `CHECK` constraint requiring it whenever
+  `source_type = 'ai_extraction'`. The earlier draft of this migration
+  only had `extracted_by TEXT` (a free-text label like `'gemini'`) — that
+  was a real gap against "linked to an enrichment run," not just a
+  wording issue, and is fixed in this revision.
+- **Reversible without deleting original evidence.** `lead_evidence` rows
+  are append-only by convention: a correction is a new row, never an
+  `UPDATE`/`DELETE` of an existing one. This is enforced today by access
+  control, not a database trigger — the RLS policies below grant
+  `authenticated` `SELECT` only on `lead_evidence` and
+  `ai_enrichment_runs` (no `UPDATE`/`DELETE`), so only the service-role
+  key (used exclusively by Edge Functions) can write at all. That means
+  the guarantee currently depends on Edge Function code never issuing an
+  `UPDATE`/`DELETE` against these tables — worth revisiting with an
+  actual `BEFORE UPDATE OR DELETE` trigger that rejects the statement if
+  this ever needs to be airtight against a bug in that code, rather than
+  just a documented convention.
+- **Never overwrite raw source data with model output.** `properties` and
+  `properties.raw_data` are untouched by this migration; `lead_evidence`
+  is an entirely separate table, so there's no code path by which
+  enrichment can clobber an ingested fact.
+
+### Required once Phase 1+ code is written
+
+- **Env vars only, never inline.** `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `SKIPDATA_API_KEY`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`,
+  `SUPABASE_SERVICE_ROLE_KEY`, `ENRICHMENT_WEBHOOK_SECRET`, and
+  `INTERNAL_ADMIN_EMAILS` are documented as reserved in `.env.example`
+  (unset, so nothing accidentally activates before its phase is approved).
+  `SUPABASE_SERVICE_ROLE_KEY` must never reach browser/client-side code —
+  only `SUPABASE_ANON_KEY` is safe there, and only under RLS.
+- **Minimize what reaches the LLM.** `lead-classify` (Gemini) and
+  `lead-review` (Claude) read `properties` + `property_scores` (public
+  record / vendor data) to classify a lead. They must not read
+  `lead_contacts` — phone numbers, emails, and mailing addresses are not
+  needed to classify or score a lead, so they should never be part of
+  `ai_enrichment_runs.input_ref`. If a future workflow genuinely needs a
+  model to see contact data (e.g. drafting outreach copy), that's a
+  distinct, explicitly-scoped call — not a side effect of classification.
+- **No PII/secrets in logs.** Edge Function logs (and `ai_enrichment_runs`
+  rows, which are readable by any `authenticated` user per the RLS policy
+  above) must never contain a full API key, a full phone number, an email
+  address, or a raw vendor payload. `ai_enrichment_runs.output` should
+  capture the model's classification reasoning, not a copy of whatever
+  contact-bearing payload it was (correctly) never given.
+- **`compliance_playbook`, not model prose, is authoritative for "what to
+  do next."** Already true in Phase 0's schema (§4); restated here because
+  it's the mechanism that keeps a compliance decision out of an LLM's
+  hands even once Phase 1+ ships.
