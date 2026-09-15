@@ -157,9 +157,18 @@ See `supabase/migrations/20260915120000_ai_lead_enrichment.sql`. Summary:
   DELETE` trigger, not just convention (see §9) — so a human verifying or
   correcting an AI-inferred fact is a new row with `supersedes_id` pointing
   at the one it confirms/corrects, `verified_by`/`verified_at` set at that
-  row's insert time. `lead_workbench`'s fact counts only count rows nothing
-  else supersedes, so a verified fact isn't double-counted as both
-  confirmed and unverified.
+  row's insert time. A companion `is_current` boolean is the one
+  system-managed exception (flipped `TRUE`→`FALSE` on the superseded row
+  automatically, by trigger, on insert — never by application code
+  directly): it turns "what's true right now for this lead" into a direct
+  indexed lookup (`lead_evidence_current`, a thin view filtering on it)
+  instead of scanning a field's entire correction history on every read.
+  A partial unique index enforces at most one current row per
+  `(lead_id, field_name)`, so an insert that forgets to set
+  `supersedes_id` when superseding fails loudly instead of silently
+  leaving two disagreeing "current" facts. `lead_workbench`'s fact counts
+  read from `lead_evidence_current`, so a verified fact isn't
+  double-counted as both confirmed and unverified.
 - `ai_enrichment_runs` — audit log of every Gemini/Claude call: model,
   run_type, input reference, raw output, confidence_score,
   flagged_for_review.
@@ -279,24 +288,38 @@ change, listed first; the rest apply once Phase 1+ code is written.
   was a real gap against "linked to an enrichment run," not just a
   wording issue, and is fixed in this revision.
 - **Reversible without deleting original evidence — DB-enforced, not just
-  a convention.** `lead_evidence` has a `BEFORE UPDATE OR DELETE` trigger
-  (`trg_lead_evidence_immutable`) that unconditionally raises an exception,
-  and it fires for every role — including the service-role key Edge
-  Functions use, which bypasses RLS but not triggers. So a bug in Edge
-  Function code that tried to `UPDATE` or `DELETE` a row would fail loudly
-  at the database, not silently corrupt the audit trail. Correcting or
-  verifying a fact is a new row with `supersedes_id` pointing at the one it
-  replaces (§2, §4); the original is never touched. `ai_enrichment_runs`
-  has the equivalent guard (`trg_ai_enrichment_runs_guard`): `DELETE` is
-  always rejected, and `UPDATE` is rejected unless the only columns
-  changing are `reviewed_by`/`flagged_for_review` — the model, its output,
-  and everything else about a run are immutable once logged. Verified
-  against a local Postgres instance: a direct `UPDATE`/`DELETE` on
-  `lead_evidence` fails, inserting a `supersedes_id` row succeeds and the
-  original row is untouched, `lead_workbench`'s counts correctly treat the
-  superseded row as not-current, an `ai_enrichment_runs` update touching
-  only `reviewed_by`/`flagged_for_review` succeeds, and an update touching
-  `output` (or any other column) and a `DELETE` both fail.
+  a convention, and efficient to query.** `lead_evidence` has a
+  `BEFORE UPDATE OR DELETE` trigger (`trg_lead_evidence_immutable`) that
+  fires for every role — including the service-role key Edge Functions
+  use, which bypasses RLS but not triggers — and rejects every UPDATE or
+  DELETE except one narrow, system-generated case: flipping `is_current`
+  from `TRUE` to `FALSE` with no other column changed. That one exception
+  is what makes correcting a fact efficient rather than just possible:
+  inserting a new row with `supersedes_id` set fires
+  `trg_lead_evidence_supersede`, which flips the superseded row's
+  `is_current` off automatically, so "what's true right now" for a lead is
+  a direct index lookup (`lead_evidence_current`) instead of every reader
+  re-deriving it by scanning the row's full correction history and
+  checking each one for a successor. A bug that tried to edit a fact's
+  actual value, or to flip `is_current` the wrong way, still fails loudly
+  at the database rather than silently corrupting the audit trail — and a
+  write that forgets to set `supersedes_id` when superseding a field is
+  caught by a partial unique index (`idx_lead_evidence_one_current_per_field`)
+  rather than silently leaving two disagreeing "current" facts.
+  `ai_enrichment_runs` has the analogous guard
+  (`trg_ai_enrichment_runs_guard`): `DELETE` is always rejected, and
+  `UPDATE` is rejected unless the only columns changing are
+  `reviewed_by`/`flagged_for_review` — the model, its output, and
+  everything else about a run are immutable once logged. Verified against
+  a local Postgres instance: inserting without `supersedes_id` while a
+  current row exists fails (the safety net), inserting with it succeeds
+  and auto-flips the original to not-current while leaving every other
+  column untouched, `lead_evidence_current` and `lead_workbench`'s counts
+  both reflect only the current row, a direct `UPDATE`/`DELETE` attempt
+  (including flipping `is_current` the wrong way, or combining it with any
+  other column change) fails on `lead_evidence`, and the
+  `ai_enrichment_runs` reviewed-by-only-update-succeeds /
+  output-update-fails / delete-fails behavior is unchanged.
 - **Never overwrite raw source data with model output.** `properties` and
   `properties.raw_data` are untouched by this migration; `lead_evidence`
   is an entirely separate table, so there's no code path by which

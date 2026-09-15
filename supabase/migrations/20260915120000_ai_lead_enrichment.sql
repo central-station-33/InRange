@@ -142,19 +142,31 @@ CREATE TRIGGER trg_ai_enrichment_runs_guard
 -- confidence. This is what makes "confirmed" vs. "needs verification"
 -- queryable instead of implicit in prose.
 --
--- Rows here are append-only, enforced below by trg_lead_evidence_immutable
--- (a BEFORE UPDATE OR DELETE trigger, not just an application-code
--- convention — it fires regardless of role, including the service-role
--- key, so a bug in Edge Function code cannot mutate or delete a row). A
--- verification or correction is a NEW row with `supersedes_id` pointing at
--- the row it confirms/corrects; the original stays exactly as written,
--- satisfying "reversible without deleting original evidence" as a DB
--- guarantee rather than a documented convention.
+-- Rows here are append-only — no field is ever edited and no row is ever
+-- deleted, enforced below by trg_lead_evidence_immutable (a BEFORE UPDATE
+-- OR DELETE trigger, not just an application-code convention — it fires
+-- regardless of role, including the service-role key). A verification or
+-- correction is a NEW row with `supersedes_id` pointing at the row it
+-- confirms/corrects; the original stays exactly as written, satisfying
+-- "reversible without deleting original evidence" as a DB guarantee.
 --
--- Because rows can never be updated in place, verified_by/verified_at are
--- set at INSERT time only: they describe a row that itself represents a
--- human verification action (source_type = 'agent_input', confidence =
--- 'confirmed'), not a later sign-off bolted onto an AI-authored row.
+-- `is_current` is the one narrow, system-managed exception: it is flipped
+-- true->false on the superseded row automatically, by
+-- trg_lead_evidence_supersede, when a new row naming it in supersedes_id
+-- is inserted — never by application code directly. This turns "what's
+-- true right now for this lead" from a full-history scan-and-check
+-- (every historical row, anti-joined against every other row) into a
+-- direct indexed lookup (`WHERE lead_id = ? AND is_current`), which
+-- matters once a field has been corrected several times over a lead's
+-- life and an agent workbench is polling this table repeatedly. No fact
+-- is edited or lost by this flip — is_current=false rows remain queryable
+-- in full, exactly as before.
+--
+-- Because rows can never be updated in place otherwise, verified_by/
+-- verified_at are set at INSERT time only: they describe a row that
+-- itself represents a human verification action (source_type =
+-- 'agent_input', confidence = 'confirmed'), not a later sign-off bolted
+-- onto an AI-authored row.
 CREATE TABLE lead_evidence (
   id             UUID                   PRIMARY KEY DEFAULT gen_random_uuid(),
   lead_id        UUID                   NOT NULL REFERENCES lead_records(id) ON DELETE CASCADE,
@@ -166,6 +178,7 @@ CREATE TABLE lead_evidence (
   extracted_by   TEXT,                              -- 'gemini', 'claude', 'rule_engine', or an agent identifier — descriptive only, not the audit link
   ai_run_id      UUID                   REFERENCES ai_enrichment_runs(id),  -- REQUIRED (see CHECK below) whenever source_type = 'ai_extraction'; the actual audit link
   supersedes_id  UUID                   REFERENCES lead_evidence(id),       -- set when this row verifies or corrects an earlier row for the same field_name
+  is_current     BOOLEAN                NOT NULL DEFAULT TRUE,              -- system-managed only; see trg_lead_evidence_supersede
   verified_by    UUID                   REFERENCES auth.users(id),
   verified_at    TIMESTAMPTZ,
   created_at     TIMESTAMPTZ            NOT NULL DEFAULT NOW(),
@@ -173,11 +186,33 @@ CREATE TABLE lead_evidence (
     CHECK (source_type <> 'ai_extraction' OR ai_run_id IS NOT NULL)
 );
 
+-- Allows only one narrow UPDATE: is_current flipping TRUE -> FALSE with
+-- every other column unchanged (the automatic supersede flip below).
+-- Everything else — any other column change, is_current flipping the
+-- other direction, and every DELETE — is rejected.
 CREATE OR REPLACE FUNCTION prevent_lead_evidence_mutation()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
+  IF TG_OP = 'UPDATE'
+     AND OLD.is_current IS TRUE AND NEW.is_current IS FALSE
+     AND NEW.lead_id       IS NOT DISTINCT FROM OLD.lead_id
+     AND NEW.field_name    IS NOT DISTINCT FROM OLD.field_name
+     AND NEW.field_value   IS NOT DISTINCT FROM OLD.field_value
+     AND NEW.confidence    IS NOT DISTINCT FROM OLD.confidence
+     AND NEW.source_type   IS NOT DISTINCT FROM OLD.source_type
+     AND NEW.source_detail IS NOT DISTINCT FROM OLD.source_detail
+     AND NEW.extracted_by  IS NOT DISTINCT FROM OLD.extracted_by
+     AND NEW.ai_run_id     IS NOT DISTINCT FROM OLD.ai_run_id
+     AND NEW.supersedes_id IS NOT DISTINCT FROM OLD.supersedes_id
+     AND NEW.verified_by   IS NOT DISTINCT FROM OLD.verified_by
+     AND NEW.verified_at   IS NOT DISTINCT FROM OLD.verified_at
+     AND NEW.created_at    IS NOT DISTINCT FROM OLD.created_at
+  THEN
+    RETURN NEW;
+  END IF;
+
   RAISE EXCEPTION
-    'lead_evidence is append-only: % is not permitted on id=%. Insert a new row with supersedes_id set instead.',
+    'lead_evidence is append-only except the system-managed is_current flag: % is not permitted on id=%. Insert a new row with supersedes_id set instead.',
     TG_OP, OLD.id;
 END;
 $$;
@@ -185,6 +220,34 @@ $$;
 CREATE TRIGGER trg_lead_evidence_immutable
   BEFORE UPDATE OR DELETE ON lead_evidence
   FOR EACH ROW EXECUTE FUNCTION prevent_lead_evidence_mutation();
+
+-- Auto-retires the row being superseded. Runs BEFORE INSERT so the old
+-- row is already flipped to is_current=FALSE before the new row's own
+-- insert is evaluated against idx_lead_evidence_one_current_per_field —
+-- otherwise both rows would briefly be "current" for the same field and
+-- the unique index would reject the insert.
+CREATE OR REPLACE FUNCTION lead_evidence_supersede()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.supersedes_id IS NOT NULL THEN
+    UPDATE lead_evidence
+    SET is_current = FALSE
+    WHERE id = NEW.supersedes_id AND is_current = TRUE;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_lead_evidence_supersede
+  BEFORE INSERT ON lead_evidence
+  FOR EACH ROW EXECUTE FUNCTION lead_evidence_supersede();
+
+-- Safety net: at most one current row per (lead, field). If application
+-- code inserts a new current fact for a field without pointing
+-- supersedes_id at the row it replaces, this rejects the insert instead
+-- of silently leaving two "current" facts that disagree.
+CREATE UNIQUE INDEX idx_lead_evidence_one_current_per_field
+  ON lead_evidence(lead_id, field_name) WHERE is_current;
 
 -- Skip-traced or agent-supplied contact info. Kept separate from
 -- lead_evidence because contacts carry their own compliance flags.
@@ -223,6 +286,8 @@ INSERT INTO compliance_playbook (category, jurisdiction, next_action_code, actio
 ON CONFLICT DO NOTHING;
 
 -- ─── Indexes ────────────────────────────────────────────────────────────────
+-- (idx_lead_evidence_one_current_per_field is defined above, next to the
+-- trigger it backs, since it's an invariant rather than a plain perf index)
 
 CREATE INDEX idx_lead_records_property        ON lead_records(property_id);
 CREATE INDEX idx_lead_records_status          ON lead_records(status);
@@ -266,19 +331,23 @@ CREATE POLICY "auth update lead_contacts"
 CREATE POLICY "auth read compliance_playbook"
   ON compliance_playbook FOR SELECT TO authenticated USING (true);
 
--- ─── Agent-facing view ──────────────────────────────────────────────────────
+-- ─── Agent-facing views ─────────────────────────────────────────────────────
 
--- Joins a lead to its property, its latest confirmed evidence per field,
--- and its resolved compliance action. This is the read model an agent
--- workbench (Retool or CRM UI) should query — never lead_evidence directly,
--- so confirmed/unverified stays visually distinct at the source.
---
--- Fact counts below only count "current" evidence — rows that are not
--- referenced by some later row's supersedes_id. Because lead_evidence is
--- append-only (see trg_lead_evidence_immutable), a verified or corrected
--- fact exists as two rows (the original plus the row that supersedes it);
--- counting both would double-count and misrepresent how much of a lead is
--- actually still unverified.
+-- The current fact set: exactly one row per (lead, field_name) — the tip
+-- of each field's supersession chain. A direct filter on the system-
+-- managed is_current flag (backed by idx_lead_evidence_one_current_per_field),
+-- not a full-history scan-and-anti-join. This is what agent-facing code
+-- should query to answer "what's true right now" for a lead; lead_evidence
+-- itself stays the full append-only history for auditing.
+CREATE OR REPLACE VIEW lead_evidence_current AS
+SELECT *
+FROM lead_evidence
+WHERE is_current;
+
+-- Joins a lead to its property, its current-evidence fact counts, and its
+-- resolved compliance action. This is the read model an agent workbench
+-- (Retool or CRM UI) should query — never lead_evidence directly, so
+-- confirmed/unverified stays visually distinct at the source.
 CREATE OR REPLACE VIEW lead_workbench AS
 SELECT
   lr.id                    AS lead_id,
@@ -300,14 +369,12 @@ SELECT
   cp.compliance_note,
   cp.counsel_reviewed,
   (
-    SELECT COUNT(*) FROM lead_evidence le
+    SELECT COUNT(*) FROM lead_evidence_current le
     WHERE le.lead_id = lr.id AND le.confidence = 'confirmed'
-      AND NOT EXISTS (SELECT 1 FROM lead_evidence le2 WHERE le2.supersedes_id = le.id)
   ) AS confirmed_fact_count,
   (
-    SELECT COUNT(*) FROM lead_evidence le
+    SELECT COUNT(*) FROM lead_evidence_current le
     WHERE le.lead_id = lr.id AND le.confidence IN ('ai_inferred', 'unverified')
-      AND NOT EXISTS (SELECT 1 FROM lead_evidence le2 WHERE le2.supersedes_id = le.id)
   ) AS unverified_fact_count,
   lr.created_at,
   lr.updated_at
