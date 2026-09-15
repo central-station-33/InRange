@@ -31,10 +31,22 @@ CREATE TYPE owner_type AS ENUM (
   'unknown'
 );
 
+-- Matches the required agent/UI-facing vocabulary exactly (see
+-- docs/ai-lead-enrichment-blueprint.md §10, Fair Housing & Consumer
+-- Protection) — this is the label shown next to every fact, so its
+-- wording is load-bearing, not stylistic. "Missing data" is not a value
+-- here: the absence of a current lead_evidence row for an expected
+-- field_name (see lead_evidence_current) IS the missing-data state;
+-- inventing a row to represent "we don't know this" would be worse than
+-- having no row. "Human review requirement" is likewise not a confidence
+-- level — see lead_evidence.needs_human_review below, which is orthogonal
+-- to confidence (a source-supported signal can still be in conflict with
+-- another source and need a human to resolve it).
 CREATE TYPE evidence_confidence AS ENUM (
-  'confirmed',    -- backed by a primary source (public record, vendor feed, human verification)
-  'ai_inferred',  -- derived by Gemini/Claude; not yet verified against a primary source
-  'unverified'    -- agent- or vendor-supplied, no source check performed
+  'confirmed_fact',          -- an authoritative primary source: a recorded document or a structured public/vendor record taken at face value. No reasonable dispute.
+  'source_supported_signal', -- an objective, rule-derived comparison over verified/sourced data (e.g. mailing address vs. property address, a recorded multi-property count) — real, but derived, not itself a single document
+  'hypothesis',               -- AI-generated or otherwise speculative. For agent research only — NEVER a basis for scoring, targeting, exclusion, or outreach on its own, and NEVER presented to an agent as settled
+  'unverified'                -- a human- or vendor-asserted claim with no structural source check performed (e.g. a raw agent note, an unconfirmed vendor claim)
 );
 
 CREATE TYPE evidence_source_type AS ENUM (
@@ -139,8 +151,10 @@ CREATE TRIGGER trg_ai_enrichment_runs_guard
   FOR EACH ROW EXECUTE FUNCTION prevent_ai_run_mutation();
 
 -- Provenance ledger: every fact attached to a lead, with its own source and
--- confidence. This is what makes "confirmed" vs. "needs verification"
--- queryable instead of implicit in prose.
+-- confidence. This is what makes "confirmed fact" vs. "source-supported
+-- signal" vs. "hypothesis" vs. "needs human review" queryable instead of
+-- implicit in prose (see the evidence_confidence enum above and
+-- needs_human_review below).
 --
 -- Rows here are append-only — no field is ever edited and no row is ever
 -- deleted, enforced below by trg_lead_evidence_immutable (a BEFORE UPDATE
@@ -165,25 +179,63 @@ CREATE TRIGGER trg_ai_enrichment_runs_guard
 -- Because rows can never be updated in place otherwise, verified_by/
 -- verified_at are set at INSERT time only: they describe a row that
 -- itself represents a human verification action (source_type =
--- 'agent_input', confidence = 'confirmed'), not a later sign-off bolted
--- onto an AI-authored row.
+-- 'agent_input', confidence = 'confirmed_fact'), not a later sign-off
+-- bolted onto an AI-authored row.
+--
+-- needs_human_review flags "data conflicts that require human review" —
+-- one of the explicitly permitted signal types in
+-- docs/ai-lead-enrichment-blueprint.md §10. It's set at insert time (like
+-- everything else here) when a new current row disagrees with what it
+-- supersedes; resolving the conflict is, as always, a further superseding
+-- insert, not a mutation of this flag.
+--
+-- lead_evidence_field_name_not_prohibited is a defense-in-depth blocklist,
+-- not a complete guarantee: it catches an engineer or a careless prompt
+-- literally naming a field after a protected characteristic or a
+-- prohibited inference (race, religion, disability, divorce_status,
+-- financial_hardship, health_status, immigration_status,
+-- family_composition, vulnerability, etc. — see §10 for the full list and
+-- rationale). It cannot catch a semantic proxy smuggled into field_value
+-- or free text (source_detail, lead_records.rationale,
+-- ai_enrichment_runs.output) — that has to be caught at prompt design and
+-- human review time, which §10 covers.
 CREATE TABLE lead_evidence (
-  id             UUID                   PRIMARY KEY DEFAULT gen_random_uuid(),
-  lead_id        UUID                   NOT NULL REFERENCES lead_records(id) ON DELETE CASCADE,
-  field_name     TEXT                   NOT NULL,   -- e.g. 'owner_type', 'sale_date', 'is_absentee'
-  field_value    TEXT                   NOT NULL,
-  confidence     evidence_confidence    NOT NULL,
-  source_type    evidence_source_type   NOT NULL,
-  source_detail  TEXT,                              -- dataset name, document ID, or agent note
-  extracted_by   TEXT,                              -- 'gemini', 'claude', 'rule_engine', or an agent identifier — descriptive only, not the audit link
-  ai_run_id      UUID                   REFERENCES ai_enrichment_runs(id),  -- REQUIRED (see CHECK below) whenever source_type = 'ai_extraction'; the actual audit link
-  supersedes_id  UUID                   REFERENCES lead_evidence(id),       -- set when this row verifies or corrects an earlier row for the same field_name
-  is_current     BOOLEAN                NOT NULL DEFAULT TRUE,              -- system-managed only; see trg_lead_evidence_supersede
-  verified_by    UUID                   REFERENCES auth.users(id),
-  verified_at    TIMESTAMPTZ,
-  created_at     TIMESTAMPTZ            NOT NULL DEFAULT NOW(),
+  id                 UUID                   PRIMARY KEY DEFAULT gen_random_uuid(),
+  lead_id            UUID                   NOT NULL REFERENCES lead_records(id) ON DELETE CASCADE,
+  field_name         TEXT                   NOT NULL,   -- e.g. 'owner_type', 'sale_date', 'is_absentee'
+  field_value        TEXT                   NOT NULL,
+  confidence         evidence_confidence    NOT NULL,
+  source_type        evidence_source_type   NOT NULL,
+  source_detail      TEXT,                              -- dataset name, document ID, or agent note
+  extracted_by       TEXT,                              -- 'gemini', 'claude', 'rule_engine', or an agent identifier — descriptive only, not the audit link
+  ai_run_id          UUID                   REFERENCES ai_enrichment_runs(id),  -- REQUIRED (see CHECK below) whenever source_type = 'ai_extraction'; the actual audit link
+  supersedes_id      UUID                   REFERENCES lead_evidence(id),       -- set when this row verifies or corrects an earlier row for the same field_name
+  is_current         BOOLEAN                NOT NULL DEFAULT TRUE,              -- system-managed only; see trg_lead_evidence_supersede
+  needs_human_review BOOLEAN                NOT NULL DEFAULT FALSE,             -- set at insert time when this row conflicts with what it supersedes
+  verified_by        UUID                   REFERENCES auth.users(id),
+  verified_at        TIMESTAMPTZ,
+  created_at         TIMESTAMPTZ            NOT NULL DEFAULT NOW(),
   CONSTRAINT ai_evidence_must_link_to_run
-    CHECK (source_type <> 'ai_extraction' OR ai_run_id IS NOT NULL)
+    CHECK (source_type <> 'ai_extraction' OR ai_run_id IS NOT NULL),
+  -- The blueprint's first design rule, DB-enforced rather than just
+  -- documented: an AI model's own extraction can never be recorded as a
+  -- verified fact. A human reviewer confirming an AI-inferred value still
+  -- inserts a NEW row (source_type = 'agent_input', confidence =
+  -- 'confirmed_fact') per the supersedes_id model above — that's a human
+  -- act of verification, not the model asserting its own output as true.
+  CONSTRAINT ai_extraction_never_confirmed_fact
+    CHECK (source_type <> 'ai_extraction' OR confidence <> 'confirmed_fact'),
+  -- Leading boundary only (^ or preceded by _/-), deliberately no trailing
+  -- boundary: several of these are stems meant to catch suffixed variants
+  -- (divorc -> divorced/divorce_status, disab -> disability/disabled,
+  -- vulnerab -> vulnerable/vulnerability, handicap -> handicapped). A
+  -- trailing boundary would silently defeat exactly those — verified
+  -- against a local Postgres instance that 'divorce_status' is rejected
+  -- and that leading-boundary real NJ county names sharing a substring
+  -- (essex_county, middlesex_county — both in docs/data-sources.md) are
+  -- NOT false-flagged, since "sex" only matches when it starts a token.
+  CONSTRAINT lead_evidence_field_name_not_prohibited
+    CHECK (field_name !~* '(^|[_-])(race|color|religion|creed|national[_-]?origin|nationality|citizenship|immigrat|ethnicit|sex|gender|transgender|cisgender|sexual[_-]?orientation|disab|handicap|familial[_-]?status|family[_-]?composition|marital[_-]?status|divorc|financial[_-]?hardship|hardship|health|medical|vulnerab|protected[_-]?class|intent[_-]?to[_-]?sell)')
 );
 
 -- Allows only one narrow UPDATE: is_current flipping TRUE -> FALSE with
@@ -203,10 +255,11 @@ BEGIN
      AND NEW.source_detail IS NOT DISTINCT FROM OLD.source_detail
      AND NEW.extracted_by  IS NOT DISTINCT FROM OLD.extracted_by
      AND NEW.ai_run_id     IS NOT DISTINCT FROM OLD.ai_run_id
-     AND NEW.supersedes_id IS NOT DISTINCT FROM OLD.supersedes_id
-     AND NEW.verified_by   IS NOT DISTINCT FROM OLD.verified_by
-     AND NEW.verified_at   IS NOT DISTINCT FROM OLD.verified_at
-     AND NEW.created_at    IS NOT DISTINCT FROM OLD.created_at
+     AND NEW.supersedes_id      IS NOT DISTINCT FROM OLD.supersedes_id
+     AND NEW.needs_human_review IS NOT DISTINCT FROM OLD.needs_human_review
+     AND NEW.verified_by        IS NOT DISTINCT FROM OLD.verified_by
+     AND NEW.verified_at        IS NOT DISTINCT FROM OLD.verified_at
+     AND NEW.created_at         IS NOT DISTINCT FROM OLD.created_at
   THEN
     RETURN NEW;
   END IF;
@@ -297,6 +350,7 @@ CREATE INDEX idx_lead_evidence_lead           ON lead_evidence(lead_id);
 CREATE INDEX idx_lead_evidence_ai_run         ON lead_evidence(ai_run_id) WHERE ai_run_id IS NOT NULL;
 CREATE INDEX idx_lead_evidence_supersedes     ON lead_evidence(supersedes_id) WHERE supersedes_id IS NOT NULL;
 CREATE INDEX idx_lead_evidence_confidence     ON lead_evidence(confidence);
+CREATE INDEX idx_lead_evidence_needs_review   ON lead_evidence(lead_id) WHERE needs_human_review;
 CREATE INDEX idx_ai_enrichment_runs_lead      ON ai_enrichment_runs(lead_id);
 CREATE INDEX idx_ai_enrichment_runs_flagged   ON ai_enrichment_runs(flagged_for_review) WHERE flagged_for_review;
 CREATE INDEX idx_lead_contacts_lead           ON lead_contacts(lead_id);
@@ -344,10 +398,20 @@ SELECT *
 FROM lead_evidence
 WHERE is_current;
 
--- Joins a lead to its property, its current-evidence fact counts, and its
--- resolved compliance action. This is the read model an agent workbench
--- (Retool or CRM UI) should query — never lead_evidence directly, so
--- confirmed/unverified stays visually distinct at the source.
+-- Joins a lead to its property, its resolved compliance action, and one
+-- aggregate pass over its current evidence — one column per required
+-- distinction (see docs/ai-lead-enrichment-blueprint.md §10): confirmed
+-- fact, source-supported signal, hypothesis, unverified, and needs-review.
+-- "Missing data" isn't a count here — it's whatever expected field_name
+-- has no row at all, which agent-facing code checks for directly. This is
+-- the read model an agent workbench (Retool or CRM UI) should query —
+-- never lead_evidence directly, so these stay visually distinct at the
+-- source rather than collapsed into one ambiguous label.
+--
+-- The evidence-count aggregation is a single GROUP BY joined once per
+-- lead, not five separate correlated subqueries re-scanning
+-- lead_evidence_current per lead — the count columns are cheap to add to
+-- because they're FILTER clauses over the same one pass, not five passes.
 CREATE OR REPLACE VIEW lead_workbench AS
 SELECT
   lr.id                    AS lead_id,
@@ -365,21 +429,29 @@ SELECT
   p.county,
   p.owner_name,
   cp.next_action_code,
-  cp.action_label          AS next_action_label,
+  cp.action_label                   AS next_action_label,
   cp.compliance_note,
   cp.counsel_reviewed,
-  (
-    SELECT COUNT(*) FROM lead_evidence_current le
-    WHERE le.lead_id = lr.id AND le.confidence = 'confirmed'
-  ) AS confirmed_fact_count,
-  (
-    SELECT COUNT(*) FROM lead_evidence_current le
-    WHERE le.lead_id = lr.id AND le.confidence IN ('ai_inferred', 'unverified')
-  ) AS unverified_fact_count,
+  COALESCE(ec.confirmed_fact_count, 0)          AS confirmed_fact_count,
+  COALESCE(ec.source_supported_count, 0)        AS source_supported_count,
+  COALESCE(ec.hypothesis_count, 0)              AS hypothesis_count,
+  COALESCE(ec.unverified_count, 0)              AS unverified_count,
+  COALESCE(ec.needs_review_count, 0)            AS needs_review_count,
   lr.created_at,
   lr.updated_at
 FROM lead_records lr
 JOIN properties p ON p.id = lr.property_id
 LEFT JOIN compliance_playbook cp
   ON cp.category = lr.category AND cp.jurisdiction = p.state
+LEFT JOIN (
+  SELECT
+    lead_id,
+    COUNT(*) FILTER (WHERE confidence = 'confirmed_fact')          AS confirmed_fact_count,
+    COUNT(*) FILTER (WHERE confidence = 'source_supported_signal') AS source_supported_count,
+    COUNT(*) FILTER (WHERE confidence = 'hypothesis')              AS hypothesis_count,
+    COUNT(*) FILTER (WHERE confidence = 'unverified')               AS unverified_count,
+    COUNT(*) FILTER (WHERE needs_human_review)                      AS needs_review_count
+  FROM lead_evidence_current
+  GROUP BY lead_id
+) ec ON ec.lead_id = lr.id
 ORDER BY lr.tier NULLS LAST, lr.updated_at DESC;

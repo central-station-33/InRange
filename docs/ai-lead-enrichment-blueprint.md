@@ -44,9 +44,11 @@ Five questions the lead record must answer, mapped to storage:
 
 | Question | Where it lives |
 |---|---|
-| What is confirmed? | `lead_evidence` rows with `confidence = 'confirmed'` (sourced from a public record, vendor feed, or human verification) |
-| What needs verification? | `lead_evidence` rows with `confidence IN ('ai_inferred','unverified')` |
-| Why might this be worth investigating? | `lead_records.rationale` (generated, always paired with the evidence rows that justify it) + `ai_enrichment_runs.output` |
+| What is confirmed? | `lead_evidence_current` rows with `confidence = 'confirmed_fact'` (an authoritative primary source, taken at face value) |
+| What's a source-supported signal (real, but derived)? | `lead_evidence_current` rows with `confidence = 'source_supported_signal'` (e.g. an address-mismatch comparison over verified data) |
+| What needs verification? | `lead_evidence_current` rows with `confidence IN ('hypothesis','unverified')`, or `needs_human_review = TRUE` on any current row (see §10) |
+| What's missing entirely? | No current `lead_evidence` row for an expected `field_name` — absence, not a special value (see §10) |
+| Why might this be worth investigating? | `lead_records.rationale` (generated, always paired with the evidence rows that justify it, and itself a hypothesis, not an assertion) + `ai_enrichment_runs.output` |
 | Who should work it? | `lead_records.assigned_agent_id`, `lead_records.assignment_reason` |
 | What is the compliant next action? | `lead_records.next_action_code` → resolved against `compliance_playbook`, never freeform AI text |
 
@@ -65,7 +67,14 @@ distress *signals* so much as lead *motivations* or *owner situations*:
 - `llc_owned` — title held by an LLC (ownership structure, not a distress signal)
 - `investor_owned` — owner holds 2+ parcels or is flagged by a vendor as an investor entity
 - `probate_estate` — owner deceased, estate in probate (distinct from generic `probate` flag; only used when sourced from a permitted probate/surrogate's-court feed, never inferred from a death record alone)
-- `relocation_seller` — signals suggesting an owner may be relocating (new job filing, address change on file, etc.) — always `ai_inferred` or `unverified`, never `confirmed`, since it's a prediction
+- `relocation_seller` — signals suggesting an owner may be relocating (an
+  objectively sourced signal, e.g. a recorded address change on file — see
+  §10 for what's permitted here) — evidence for this category is always
+  `hypothesis` or `unverified`, **never** `confirmed_fact` or
+  `source_supported_signal`, since "intent to sell" is a prediction, not a
+  fact, whatever the underlying signal's own quality (§10 is explicit:
+  never infer "intent to sell" as a fact, and never derive this from
+  family composition, marital status, or any other prohibited inference)
 
 `owner_type` (`individual`, `llc`, `trust`, `estate`, `investor_entity`,
 `government`, `unknown`) is stored separately from category — an absentee
@@ -80,11 +89,16 @@ Existing: ingest-nyc / ingest-nj → score-properties → properties + property_
                                           ▼
                               [NEW] lead-classify (Gemini)
                               Primary extraction/classification pass.
-                              Reads property + score + raw_data, writes:
+                              Reads property + score + raw_data (never
+                              lead_contacts — see §9) and writes:
                                 - lead_records row (category, owner_type, draft tier)
-                                - lead_evidence rows, confidence='ai_inferred'
-                                  for anything Gemini derived from raw_data
-                                  that wasn't already a structured field
+                                - lead_evidence rows: confidence='hypothesis'
+                                  for anything Gemini derived by inference,
+                                  or 'source_supported_signal' when it's a
+                                  direct rule-derived comparison over
+                                  already-structured/sourced fields — never
+                                  'confirmed_fact' (§9/§10: an AI model
+                                  never writes that value)
                                           │
                                           ▼
                          confidence_score < threshold
@@ -352,3 +366,104 @@ change, listed first; the rest apply once Phase 1+ code is written.
   do next."** Already true in Phase 0's schema (§4); restated here because
   it's the mechanism that keeps a compliance decision out of an LLM's
   hands even once Phase 1+ ships.
+
+## 10. Fair Housing & Consumer Protection (non-negotiable)
+
+These rules bind every phase, including Phase 0's schema. Two things are
+already DB-enforced (listed first); the rest is prompt-design and process
+discipline for Phase 1+, which the schema can support but can't fully
+guarantee on its own — that limitation is stated plainly below rather than
+implied away.
+
+### Never, on any basis
+
+Do not create, infer, store, score, rank, target, exclude, or personalize
+outreach based on: race, color, religion, national origin, sex, gender
+identity, sexual orientation, disability, familial status, age (where
+prohibited or inappropriate — see caveat below), any other protected
+characteristic, or any proxy designed to approximate one.
+
+Do not infer, as a system output: divorce status (from names, online
+behavior, or any unsupported signal), financial hardship, health status,
+disability, immigration/nationality status, family composition,
+vulnerability, or intent to sell presented as a fact.
+
+**`age` is deliberately not in the DB blocklist below.** The instruction
+itself hedges ("where prohibited or inappropriate"), which isn't something
+a regex can judge — a blanket block would either miss legitimate
+jurisdiction-specific uses or false-positive on unrelated fields (`stage`,
+`storage_unit`, `average_*`). This one needs counsel judgment per use case,
+not a blunt DB rule; flagged here so it isn't silently dropped.
+
+### Already DB-enforced in Phase 0
+
+- **A hard blocklist on `lead_evidence.field_name`**
+  (`lead_evidence_field_name_not_prohibited`) rejects field names built
+  around any of the above (`race`, `disab*`, `divorc*`, `familial_status`,
+  `financial_hardship`, `health`, `immigrat*`, `vulnerab*`,
+  `intent_to_sell`, etc.) at insert time, for every role. This is
+  defense-in-depth, not a complete guarantee — verified against a local
+  Postgres instance that it: (a) rejects `divorce_status`,
+  `disability_flag`, `vulnerable_score`, `is_handicapped`, `owner_race`,
+  `immigration_status`, `ethnicity_guess`, and `intent_to_sell`; (b) does
+  **not** false-positive on real field names that happen to share a
+  substring, e.g. `essex_county` / `middlesex_county` (both are real NJ
+  counties named in `docs/data-sources.md`) despite containing "sex" —
+  the leading-boundary requirement means the blocked term has to *start*
+  a token, not just appear inside one. It cannot catch a proxy smuggled
+  into free text — `lead_evidence.source_detail`,
+  `lead_records.rationale`, or `ai_enrichment_runs.output` are all
+  unstructured and unconstrained by this CHECK. That gap is a prompt-design
+  and human-review problem, not a schema problem; see below.
+- **`ai_extraction_never_confirmed_fact`** — a `lead_evidence` row can
+  never have `source_type = 'ai_extraction'` and
+  `confidence = 'confirmed_fact'` at the same time. This is the
+  blueprint's opening design rule (§1: "an AI-derived field is never
+  presented as a verified fact") as an actual constraint, not just a
+  sentence at the top of a doc a future engineer might not read. A human
+  confirming an AI-inferred value still has to go through the normal
+  supersede-with-a-new-row path (§2, §4), recorded as their own act of
+  verification (`source_type = 'agent_input'`), not the model vouching for
+  itself.
+
+### Permitted signals — and how they map to what's already built
+
+The system may identify these objectively sourced, permitted business
+signals (the categories and mechanisms already in §2/§4 of this doc):
+
+| Permitted signal | Schema mechanism |
+|---|---|
+| Absentee-owner status from verified mailing/property-address mismatch | `lead_category = 'absentee_owner'` / `'out_of_area_owner'`, evidence at `confidence = 'source_supported_signal'` |
+| Publicly recorded foreclosure indicator | `lead_category = 'pre_foreclosure'` / `'foreclosure'` / `'reo'`, evidence at `confidence = 'confirmed_fact'`, `source_type = 'public_record'` |
+| Expired-listing indicator from permitted data source | `lead_category = 'expired_listing'`, `source_type = 'vendor_feed'` |
+| Entity ownership from recorded ownership source | `owner_type = 'llc'/'trust'/'estate'/'investor_entity'`, `lead_category = 'llc_owned'` |
+| Multi-property ownership where supported by sourced data | `lead_category = 'investor_owned'`, `confidence = 'source_supported_signal'` |
+| Long ownership tenure based on verified recorded data | a `lead_evidence` row (`field_name = 'ownership_tenure_years'` or similar), `confidence = 'confirmed_fact'`, `source_type = 'public_record'` |
+| Data conflicts that require human review | `lead_evidence.needs_human_review = TRUE` (§4) — set when a new current row disagrees with what it supersedes |
+
+### Required once Phase 1+ code is written (the DB can't do this alone)
+
+- **Prompt construction must never pass protected-characteristic data as
+  input**, even incidentally (e.g. a raw vendor record that happens to
+  include a religious-institution name as `owner_name` should be passed
+  as an address/entity fact, not framed as a religion signal). This is a
+  Phase 1 (`lead-classify`)/Phase 2 (`lead-review`) prompt-design
+  requirement, not something `ai_extraction_never_confirmed_fact` or the
+  field-name blocklist can verify.
+- **Prompt construction must never ask the model to infer** any of the
+  "never infer" list above — not "is this owner going through a divorce,"
+  not "estimate financial hardship," not "guess health status." The model
+  may be asked to extract and classify from `properties`/`property_scores`
+  structured data only, per §3.
+- **`lead_records.rationale` and `ai_enrichment_runs.output` need a
+  review pass**, at least a sampling-based one, checking they don't smuggle
+  a prohibited inference into prose that the field-name blocklist can't
+  see (e.g. a Claude-generated rationale that reads "owner appears to be
+  going through a life transition" is a euphemism for exactly what's
+  banned above, even though it never touches a blocked `field_name`).
+- **The five-way distinction (confirmed fact / source-supported signal /
+  hypothesis / missing data / human review requirement) must be visible in
+  whatever UI or CRM surface Phase 4 builds**, not just present in the
+  database. `lead_workbench`'s per-bucket counts (§4) are meant to back an
+  actual visual distinction — e.g. different badge colors or icons per
+  bucket — not just a number nobody looks at.
