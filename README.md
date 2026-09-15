@@ -56,6 +56,7 @@ supabase/
   migrations/
     20240101000000_initial_schema.sql        # Tables + RLS + indexes
     20240101000001_views_and_functions.sql   # Views + SQL helpers
+    20260915120000_ai_lead_enrichment.sql    # Lead/evidence schema (blueprint Phase 0)
   functions/
     _shared/
       types.ts                      # Shared TypeScript types
@@ -69,6 +70,7 @@ supabase/
 docs/
   make-scenarios.md                 # Make.com scenario blueprints
   data-sources.md                   # Data source reference + field mapping
+  ai-lead-enrichment-blueprint.md   # JRA CRM lead-enrichment architecture proposal
 .env.example                        # Required environment variables
 ```
 
@@ -110,6 +112,23 @@ Key views to expose in Retool tables:
 | All Leads | `leads_dashboard` |
 | Tier 1 Leads | `leads_dashboard` (filter: tier = 1) |
 | Ingestion Logs | `ingestion_runs` |
+
+## AI Lead Enrichment (JRA CRM) — Blueprint
+
+`docs/ai-lead-enrichment-blueprint.md` specifies a proposed extension of this
+pipeline into a source-backed, agent-facing lead system for Jet Realty
+Advisors, covering pre-foreclosure/REO/absentee/LLC/probate/expired-listing
+categories, a Gemini-primary/Claude-second-pass enrichment flow, and an
+evidence ledger so AI-derived fields are never presented as verified facts.
+
+Phase 0 of that blueprint (additive schema only — `lead_records`,
+`lead_evidence`, `ai_enrichment_runs`, `lead_contacts`,
+`compliance_playbook`, `lead_workbench` view) ships in
+`supabase/migrations/20260915120000_ai_lead_enrichment.sql`. It does not
+change any existing table, function, or Make.com scenario. Later phases
+(Gemini/Claude Edge Functions, SkipData wiring, compliance-playbook content)
+require sign-off — see "Open decisions" in the blueprint doc before building
+them.
 
 ## Data Sources
 
