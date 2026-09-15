@@ -207,7 +207,7 @@ Deno.serve(async (req) => {
     for (let i = 0; i < taxLiens.length; i += BATCH) {
       const batch = taxLiens.slice(i, i + BATCH).map(toDbRow);
       const { error } = await supabase
-        .from('properties')
+        .from('legacy_properties')
         .upsert(batch, { onConflict: 'source,parcel_id' });
       if (error) throw error;
       upserted += batch.length;
