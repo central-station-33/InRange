@@ -1,20 +1,22 @@
 /**
- * notify-subscribers — Final step in the Make.com pipeline.
- * Finds Tier 1–2 properties (with AI summaries) that haven't been sent to
- * matching subscribers yet, then delivers notifications via:
- *   - Webhook (Make.com receives and routes to email/SMS/Slack)
- *   - Direct HTTP POST to subscriber.webhook_url (if set)
+ * notify-subscribers — Queues (never sends) notifications for Tier 1–2
+ * properties to matching subscribers.
+ *
+ * Outreach controls: this function NEVER dispatches an email, SMS, call,
+ * or webhook on its own. For every subscriber/property match it runs a
+ * campaign eligibility check and a consent/DNC check, then inserts a
+ * `notifications` row with status='pending_approval'. Actual delivery only
+ * happens through the `approve-notification` function, which requires a
+ * human agent identifier. Every decision (queued, blocked, and why) is
+ * written to `activity_log`.
  *
  * Accepts optional POST body:
  *   { max_tier?: number; limit?: number }
  */
 
 import { getServiceClient, jsonResponse, verifyMakeSecret } from '../_shared/supabase-client.ts';
+import { checkCampaignEligibility, checkConsent, logActivity } from '../_shared/outreachControls.ts';
 import type { Market, Subscriber } from '../_shared/types.ts';
-
-// Make.com outbound webhook — receives notification payloads and handles delivery
-// Set MAKE_NOTIFY_WEBHOOK in Supabase vault/env to enable this channel.
-const MAKE_NOTIFY_WEBHOOK = Deno.env.get('MAKE_NOTIFY_WEBHOOK') ?? '';
 
 interface ScoredProperty {
   id: string;
@@ -53,17 +55,7 @@ function buildPayload(prop: ScoredProperty, sub: Subscriber) {
     distress_flags: flagSummary,
     ai_summary:     prop.ai_summary,
     source:         prop.source.toUpperCase(),
-    sent_at:        new Date().toISOString(),
   };
-}
-
-async function sendWebhook(url: string, payload: unknown): Promise<void> {
-  const res = await fetch(url, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error(`Webhook POST ${res.status}: ${await res.text()}`);
 }
 
 Deno.serve(async (req) => {
@@ -91,95 +83,102 @@ Deno.serve(async (req) => {
       .eq('active', true);
     if (subErr) throw subErr;
     if (!subscribers || subscribers.length === 0) {
-      return jsonResponse({ success: true, sent: 0, message: 'No active subscribers' });
+      return jsonResponse({ success: true, queued: 0, message: 'No active subscribers' });
     }
 
-    // Fetch new scored properties (with AI summaries) not yet notified to this subscriber
+    // Only properties whose enrichment cleared the model-routing quality bar
+    // (review_status not 'pending'/'human_review') are eligible for outreach.
     const { data: properties, error: propErr } = await supabase
-      .from('scored_properties')
+      .from('campaign_eligible_properties')
       .select(
         'id, source, address, city, state, county, owner_name, assessed_value,' +
         'market_value, distress_flags, composite_score, tier, ai_summary',
       )
       .lte('tier', maxTier)
-      .not('ai_summary', 'is', null)
       .order('composite_score', { ascending: false })
       .limit(limit);
     if (propErr) throw propErr;
     if (!properties || properties.length === 0) {
-      return jsonResponse({ success: true, sent: 0, message: 'No enriched properties to notify' });
+      return jsonResponse({ success: true, queued: 0, message: 'No campaign-eligible properties' });
     }
 
-    let sent   = 0;
+    let queued  = 0;
+    let blocked = 0;
     let skipped = 0;
     const errors: string[] = [];
 
     for (const sub of subscribers as Subscriber[]) {
+      // Campaign eligibility check: is this subscriber even a candidate for
+      // these properties (tier/market/active)? Non-matches are simply not
+      // candidates for this campaign — no notification row is created for
+      // them, same as before this policy was enforced.
       const matchingProps = (properties as ScoredProperty[]).filter(
-        (p) =>
-          p.tier <= sub.min_tier &&  // min_tier means "notify me at this tier or better"
-          (sub.target_markets.length === 0 || sub.target_markets.includes(p.source)),
+        (p) => checkCampaignEligibility(sub, p).eligible,
       );
+      if (matchingProps.length === 0) continue;
+
+      // Consent/DNC check: for candidates that DO match, has a human
+      // cleared this subscriber to be contacted? A failure here is a real
+      // outreach-control decision and is logged per matched property.
+      const consentCheck = checkConsent(sub);
 
       for (const prop of matchingProps) {
-        // Skip if already notified (unique constraint on subscriber+property+channel)
         const channel = sub.webhook_url ? 'webhook' : sub.email ? 'email' : 'sms';
 
-        // Insert notification record (will fail silently on duplicate due to unique constraint)
         const { data: inserted, error: insertErr } = await supabase
           .from('notifications')
           .insert({
-            subscriber_id: sub.id,
-            property_id:   prop.id,
+            subscriber_id:       sub.id,
+            property_id:         prop.id,
             channel,
-            status:        'pending',
-            payload:       buildPayload(prop, sub),
+            status:               consentCheck.eligible ? 'pending_approval' : 'blocked',
+            eligibility_checked:  true,
+            consent_verified:     consentCheck.eligible,
+            block_reason:         consentCheck.eligible ? null : consentCheck.reason,
+            payload:              buildPayload(prop, sub),
           })
           .select('id')
           .single();
 
         if (insertErr) {
-          // Unique constraint violation = already notified, skip silently
+          // Unique constraint violation = already queued/handled for this pair, skip silently
           if (insertErr.code === '23505') { skipped++; continue; }
           errors.push(`Insert ${sub.id}/${prop.id}: ${insertErr.message}`);
           continue;
         }
 
-        // Deliver the notification
-        const payload = buildPayload(prop, sub);
-        let deliveryError: string | null = null;
-
         try {
-          if (sub.webhook_url) {
-            await sendWebhook(sub.webhook_url, payload);
-          } else if (MAKE_NOTIFY_WEBHOOK) {
-            // Make.com handles email / SMS routing from here
-            await sendWebhook(MAKE_NOTIFY_WEBHOOK, payload);
+          if (consentCheck.eligible) {
+            await logActivity(supabase, {
+              entity_type: 'notification',
+              entity_id: inserted.id,
+              action: 'queued_for_approval',
+              detail: { subscriber_id: sub.id, property_id: prop.id, channel },
+            });
+            queued++;
+          } else {
+            await logActivity(supabase, {
+              entity_type: 'notification',
+              entity_id: inserted.id,
+              action: `blocked_${consentCheck.reason}`,
+              detail: { subscriber_id: sub.id, property_id: prop.id, channel },
+            });
+            blocked++;
           }
-          // If neither is set, we just log the notification as "sent" for Retool visibility
         } catch (e) {
-          deliveryError = (e as Error).message;
-        }
-
-        // Update notification status
-        await supabase
-          .from('notifications')
-          .update({
-            status:        deliveryError ? 'failed' : 'sent',
-            sent_at:       deliveryError ? null : new Date().toISOString(),
-            error_message: deliveryError,
-          })
-          .eq('id', inserted.id);
-
-        if (deliveryError) {
-          errors.push(`Delivery ${sub.id}/${prop.id}: ${deliveryError}`);
-        } else {
-          sent++;
+          errors.push(`activity_log ${sub.id}/${prop.id}: ${(e as Error).message}`);
         }
       }
     }
 
-    return jsonResponse({ success: true, sent, skipped, errors });
+    return jsonResponse({
+      success: true,
+      queued,
+      blocked,
+      skipped,
+      errors,
+      note: 'Notifications are queued with status=pending_approval. Nothing is sent until a human agent calls approve-notification.',
+    });
   } catch (err) {
     return jsonResponse({ success: false, error: (err as Error).message }, 500);
   }
