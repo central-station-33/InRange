@@ -1,5 +1,10 @@
 export type Market = 'nyc' | 'nj';
 
+// Which lead-gen segment a property belongs to. 'distressed_seller' is the
+// original segment (tax liens, foreclosures, etc); 'rental_landlord' targets
+// landlords with unrepresented ("for rent by owner") rental units.
+export type Segment = 'distressed_seller' | 'rental_landlord';
+
 export type DistressType =
   | 'tax_lien'
   | 'foreclosure'
@@ -7,9 +12,15 @@ export type DistressType =
   | 'probate'
   | 'code_violation'
   | 'vacant'
-  | 'tax_delinquent';
+  | 'tax_delinquent'
+  // Rental / landlord motivation signals
+  | 'frbo_unrepresented'
+  | 'long_dom_rental'
+  | 'portfolio_landlord';
 
 export type Tier = 1 | 2 | 3 | 4;
+
+export type ClaimStatus = 'unclaimed' | 'claimed';
 
 export interface DistressFlag {
   type: DistressType;
@@ -21,6 +32,7 @@ export interface DistressFlag {
 export interface Property {
   id?: string;
   source: Market;
+  segment: Segment;
   parcel_id: string;
   address: string;
   city: string;
@@ -33,6 +45,9 @@ export interface Property {
   market_value: number | null;
   distress_flags: DistressFlag[];
   raw_data: Record<string, unknown>;
+  claim_status?: ClaimStatus;
+  claimed_by?: string | null;
+  claimed_at?: string | null;
   created_at?: string;
   updated_at?: string;
 }

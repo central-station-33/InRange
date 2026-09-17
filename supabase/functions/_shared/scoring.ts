@@ -9,6 +9,11 @@ const SIGNAL_WEIGHTS: Record<DistressType, number> = {
   tax_delinquent: 18,
   code_violation: 12,
   vacant:         10,
+  // Rental / landlord signals — weighted toward "reachable decision-maker
+  // with no agent in the way", not physical distress
+  frbo_unrepresented: 30, // actively self-managing a rental listing today
+  portfolio_landlord: 20, // owns multiple units — higher lifetime value
+  long_dom_rental:    15, // listed 30+ days — motivated, priced wrong, or tired of self-managing
 };
 
 // Bonus for multiple co-occurring signals (stacks are stronger leads)
