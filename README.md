@@ -25,9 +25,15 @@ Retool Dashboard
 |---|---|---|---|
 | 1 | `ingest-nyc` | Daily 3 AM ET | Fetches NYC tax liens, HPD violations, ACRIS foreclosures |
 | 2 | `ingest-nj` | Daily 3:30 AM ET | Fetches NJ MOD-IV delinquencies + Make.com sheriff sale rows |
+| 2b | `ingest-rentals` | Make.com, after an Apify rental-scraper run | Ingests unrepresented ("for rent by owner") rental listings — see `docs/rental-landlord-outreach.md` |
 | 3 | `score-properties` | After each ingest | Composite 0–100 score, Tier 1–4 classification |
 | 4 | `enrich-ai` | Daily 6 AM ET | Claude AI investment memo for Tier 1–2 properties |
 | 5 | `notify-subscribers` | Daily 7 AM ET | Delivers leads via webhook / Make.com routing |
+| 6 | `claim-lead` | On-demand (agent action) | Atomically claims an unclaimed lead — see `docs/lead-claim-mechanism.md` |
+| 7 | `notify-unclaimed` | Scheduled | Alerts agents about new unclaimed leads via SMS (Make/Twilio) |
+
+Segments: `distressed_seller` (original) and `rental_landlord` (new — see
+`docs/rental-landlord-outreach.md`), tracked via `properties.segment`.
 
 ## Scoring Model
 
@@ -40,6 +46,9 @@ Retool Dashboard
 | Tax delinquent (>1 yr) | 18 |
 | HPD / code violations | 12 |
 | Vacant / abandoned | 10 |
+| For-rent-by-owner (unrepresented) | 30 |
+| Portfolio landlord (2+ unrepresented listings) | 20 |
+| Long days-on-market rental (30+ days) | 15 |
 | Multi-signal bonus (3+ flags) | +10–15 |
 
 **Tiers:**
@@ -63,12 +72,21 @@ supabase/
       scoring.ts                    # Scoring algorithm
     ingest-nyc/index.ts             # NYC Open Data ingestion
     ingest-nj/index.ts              # NJ NJOGIS + sheriff sale ingestion
+    ingest-rentals/index.ts         # Rental-landlord (FRBO) ingestion
     score-properties/index.ts       # Composite scoring engine
     enrich-ai/index.ts              # Claude API enrichment
     notify-subscribers/index.ts     # Subscriber notification delivery
+    claim-lead/index.ts             # Atomic lead-claim endpoint
+    notify-unclaimed/index.ts       # Unclaimed-lead SMS/email alert
 docs/
   make-scenarios.md                 # Make.com scenario blueprints
   data-sources.md                   # Data source reference + field mapping
+  rental-landlord-outreach.md       # Rental segment design + signals
+  lead-claim-mechanism.md           # Claim mechanism design + live-org gap found
+  wordpress-microsite-plan.md       # Niche microsite content plan
+  idx-syndication-checklist.md      # Manual IDX verification checklist
+  media-outsourcing-scope.md        # Freelance photographer/videographer scope draft
+InRange-lead-claim-alert.json       # Make blueprint: unclaimed-lead SMS alert
 .env.example                        # Required environment variables
 ```
 

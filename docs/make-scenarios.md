@@ -115,6 +115,32 @@ Build a separate "Notifications Router" scenario listening on that webhook:
 
 ---
 
+## 6 — Rental Ingest (Trigger: after an Apify rental-scraper actor run)
+
+```
+[Apify — Run Actor & wait for finish]  (rental listings scraper — see docs/rental-landlord-outreach.md)
+  └─▶ HTTP POST → ingest-rentals
+        Body: { "listings": <actor dataset items, mapped to the ingest-rentals shape> }
+```
+
+---
+
+## 7 — Lead Claim Alert (Webhook receiver: `InRange-lead-claim-alert.json`)
+
+```
+[Custom Webhook]  ← called by notify-unclaimed edge function
+  └─▶ [Twilio — Send an SMS]   (needs a send-capable Twilio connection — not yet configured)
+  └─▶ [Webhook Respond]
+```
+
+Separately, schedule a call to `notify-unclaimed` (e.g. every 15 min) to
+find newly-unclaimed leads and POST them to this webhook. See
+`docs/lead-claim-mechanism.md` for why this replaces the live org's
+`ISA Notify Receiver`, which currently only logs a placeholder touch and
+never alerts anyone.
+
+---
+
 ## Environment Variables in Make.com
 
 Store `MAKE_WEBHOOK_SECRET` in Make.com → Organization → Variables

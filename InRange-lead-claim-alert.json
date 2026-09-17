@@ -1,0 +1,77 @@
+{
+  "_note": "Reference blueprint, not yet imported into the live Make org (see docs/lead-claim-mechanism.md). The gateway:CustomWebHook and gateway:WebhookRespond modules below match the syntax already used elsewhere in this Make team (see ISA Notify Receiver, InRange-seller-intake.json) and are verified-correct. The Twilio module is NOT verified against a live Make Twilio connection — no Twilio send credential exists in this Make team yet. Before activating: (1) add a Twilio connection in Make with SMS-send capability, (2) open this module in the Make UI and re-pick 'Twilio > Send an SMS' so Make fills in the exact module version/fields itself rather than trusting the hand-written block here, (3) replace REPLACE_WITH_YOUR_WEBHOOK_ID and REPLACE_WITH_AGENT_PHONE_NUMBER.",
+  "name": "InRange — Lead Claim Alert (SMS)",
+  "flow": [
+    {
+      "id": 1,
+      "module": "gateway:CustomWebHook",
+      "version": 1,
+      "parameters": { "hook": "REPLACE_WITH_YOUR_WEBHOOK_ID", "maxResults": 1 },
+      "mapper": {},
+      "metadata": {
+        "designer": { "x": -300, "y": 0 },
+        "restore": { "parameters": { "hook": { "label": "InRange Lead Claim Alert" } } },
+        "expect": [
+          { "name": "property_id", "type": "text", "label": "Property ID" },
+          { "name": "segment", "type": "text", "label": "Segment" },
+          { "name": "address", "type": "text", "label": "Address" },
+          { "name": "county", "type": "text", "label": "County" },
+          { "name": "owner_name", "type": "text", "label": "Owner Name" },
+          { "name": "tier", "type": "number", "label": "Tier" },
+          { "name": "score", "type": "number", "label": "Score" },
+          { "name": "ai_summary", "type": "text", "label": "AI Summary" },
+          { "name": "distress_flags", "type": "text", "label": "Distress Flags" },
+          { "name": "sms_message", "type": "text", "label": "SMS Message" },
+          { "name": "alerted_at", "type": "text", "label": "Alerted At" }
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "module": "twilio:SendSMS",
+      "version": 1,
+      "parameters": {},
+      "mapper": {
+        "from": "REPLACE_WITH_TWILIO_NUMBER",
+        "to": "REPLACE_WITH_AGENT_PHONE_NUMBER",
+        "body": "{{1.sms_message}}"
+      },
+      "metadata": {
+        "designer": { "x": 0, "y": 0 },
+        "restore": {
+          "expect": {
+            "_note": "Module key/version unverified — no live Twilio-send connection exists in this Make team to confirm against. Re-add this step from the Make module picker instead of trusting this JSON verbatim."
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "module": "gateway:WebhookRespond",
+      "version": 1,
+      "parameters": {},
+      "mapper": {
+        "status": "200",
+        "body": "{\"received\":true,\"property_id\":\"{{1.property_id}}\"}",
+        "headers": [{ "name": "Content-Type", "value": "application/json" }]
+      },
+      "metadata": { "designer": { "x": 300, "y": 0 } }
+    }
+  ],
+  "metadata": {
+    "instant": true,
+    "version": 1,
+    "scenario": {
+      "roundtrips": 1,
+      "maxErrors": 3,
+      "autoCommit": true,
+      "autoCommitTriggerLast": true,
+      "sequential": true,
+      "confidential": false,
+      "dataloss": false,
+      "dlq": false,
+      "freshVariables": false
+    },
+    "designer": { "orphans": [] }
+  }
+}
