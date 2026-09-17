@@ -51,6 +51,8 @@ export interface PropertyScore {
   ai_summary: string | null;
 }
 
+export type ConsentStatus = 'unknown' | 'opted_in' | 'opted_out';
+
 export interface Subscriber {
   id: string;
   name: string | null;
@@ -60,7 +62,18 @@ export interface Subscriber {
   target_markets: Market[];
   min_tier: number;
   active: boolean;
+  consent_status: ConsentStatus;
+  dnc: boolean;
+  contactable: boolean;
 }
+
+export type NotificationStatus =
+  | 'pending_approval'
+  | 'approved'
+  | 'sent'
+  | 'rejected'
+  | 'blocked'
+  | 'failed';
 
 export interface IngestionResult {
   source: Market;

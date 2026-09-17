@@ -70,17 +70,38 @@ Or chain it directly with a Sleep module after each ingest:
 
 ---
 
+## 3b — Process Raw Records (Trigger: after Ingest NYC or NJ completes)
+
+Runs in parallel with scenario 3, on the same trigger — `process-raw-records`
+reads from `raw_records` (which ingest-nyc/ingest-nj now dual-write into
+alongside `legacy_properties`), not from anything scenario 3 produces, so
+there's no ordering dependency between the two. See
+`docs/canonical-data-model.md` for what this feeds (and doesn't feed yet).
+
+```
+[Webhook — triggered by scenario 1 or 2 on success]
+  └─▶ HTTP POST → process-raw-records
+        Body: { "limit": 200 }
+  └─▶ [Router]
+        success: Log processed / failed counts
+        error:   Alert admin
+```
+
+---
+
 ## 4 — AI Enrichment (Schedule: Daily, 6 AM ET)
 
-Runs after scoring. Processes up to 20 Tier 1–2 properties per run to
-manage Anthropic API costs (adjust `limit` as needed).
+Runs after scoring. Gemini runs first-pass on every Tier 1–2 property;
+Claude is only invoked when `enrich-ai` decides to escalate (see
+`docs/model-routing.md`), so per-run Claude cost scales with how many
+records actually escalate, not with `limit`.
 
 ```
 [Schedule trigger]
   └─▶ HTTP POST → enrich-ai
         Body: { "limit": 20, "min_tier": 1, "max_tier": 2 }
   └─▶ [Router]
-        success: Log enriched count
+        success: Log enriched / escalated_to_claude counts
         error:   Alert admin
 ```
 
@@ -88,21 +109,44 @@ manage Anthropic API costs (adjust `limit` as needed).
 
 ## 5 — Notify Subscribers (Schedule: Daily, 7 AM ET)
 
-Runs after enrichment. Sends notifications to matched subscribers.
+Runs after enrichment. This scenario only **queues** candidate
+notifications — it never sends anything. Every subscriber/property match
+gets a campaign-eligibility and consent/DNC check; eligible matches are
+inserted as `notifications.status = 'pending_approval'`, everything else as
+`status = 'blocked'`. See `docs/outreach-controls.md`.
 
 ```
 [Schedule trigger]
   └─▶ HTTP POST → notify-subscribers
         Body: { "max_tier": 2, "limit": 100 }
   └─▶ [Router]
-        Branch A (sent > 0): Log to CRM / Sheets
-        Branch B (error):    Alert admin
+        Branch A (queued > 0): Notify human agents a review queue is ready
+        Branch B (error):      Alert admin
 ```
 
-### Handling notifications in Make.com
+---
 
-The `notify-subscribers` function posts payloads to `MAKE_NOTIFY_WEBHOOK`.
-Build a separate "Notifications Router" scenario listening on that webhook:
+## 6 — Approve & Send (human-triggered, not scheduled)
+
+A human agent reviews `pending_approval` notifications (e.g. in Retool,
+against the `notifications` table) and calls `approve-notification` with
+their own identifier. This is the only scenario allowed to result in an
+actual email/SMS/webhook send.
+
+```
+[Retool "Approve" / "Reject" button]
+  └─▶ HTTP POST → approve-notification
+        Body: { "notification_id": "<uuid>", "decision": "approve", "agent": "<human agent email/id>" }
+  └─▶ [Router]
+        success (status=sent):   done
+        success (status=blocked): surface block_reason to the agent
+        error:                    alert admin
+```
+
+`approve-notification` re-checks consent/DNC/eligibility at send time, then
+posts the payload to `MAKE_NOTIFY_WEBHOOK` (or the subscriber's own
+`webhook_url`). Build a "Notifications Router" scenario listening on
+`MAKE_NOTIFY_WEBHOOK`:
 
 ```
 [Custom Webhook]
@@ -111,6 +155,18 @@ Build a separate "Notifications Router" scenario listening on that webhook:
           └─▶ Gmail / SendGrid — send lead email
         Branch: phone IS NOT NULL
           └─▶ Twilio — send SMS alert
+```
+
+## 7 — Opt-Out Processing (Trigger: inbound STOP/unsubscribe)
+
+Wire Twilio inbound "STOP" replies and any unsubscribe-link webhook to
+`process-opt-out`. This is rule-based processing of the contact's own
+request, not an autonomous AI decision.
+
+```
+[Twilio inbound webhook / unsubscribe link]
+  └─▶ HTTP POST → process-opt-out
+        Body: { "phone": "{{trigger.From}}", "source": "sms_stop" }
 ```
 
 ---
