@@ -103,6 +103,10 @@ serve(async (req) => {
     .select('id, full_name, entity_name, phone, segment, market, cadence_step, last_cadence_at, created_at')
     .in('outreach_status', ['new', 'attempting', 'contacted'])
     .eq('cadence_paused', false)
+    // Belt-and-suspenders on top of cadence_paused: never send to an
+    // opted-out lead even if something else ever resets cadence_paused
+    // without checking this first.
+    .eq('sms_opt_out', false)
     .lt('cadence_step', 5)
     .not('phone', 'is', null)
     .order('created_at', { ascending: true })

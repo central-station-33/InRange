@@ -26,6 +26,31 @@ const SEGMENT_CONTEXT: Record<string, string> = {
   film_tv:            'film/TV production professional needing housing near set',
 };
 
+// Twilio's own recognized STOP keywords (case-insensitive, exact match after
+// trim) -- https://www.twilio.com/docs/messaging/features/opt-out-keywords
+const OPT_OUT_KEYWORDS = new Set(['stop', 'stopall', 'unsubscribe', 'cancel', 'end', 'quit']);
+
+function isOptOutMessage(message?: string): boolean {
+  if (!message) return false;
+  return OPT_OUT_KEYWORDS.has(message.trim().toLowerCase());
+}
+
+async function sendSms(phone: string, body: string): Promise<boolean> {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) return false;
+  const res = await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${btoa(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`)}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ To: phone, From: TWILIO_FROM_NUMBER, Body: body }).toString(),
+    }
+  );
+  return res.ok;
+}
+
 serve(async (req) => {
   if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
   if (!MAKE_SECRET) return json({ error: 'Server misconfigured' }, 500);
@@ -47,14 +72,29 @@ serve(async (req) => {
   const supabase = getServiceClient();
 
   const [{ data: byPhone }, { data: byEmail }] = await Promise.all([
-    phone ? supabase.from('isa_leads').select('id,segment,market,outreach_status,first_response_at')
+    phone ? supabase.from('isa_leads').select('id,segment,market,outreach_status,first_response_at,sms_opt_out')
               .eq('phone', phone).not('outreach_status','in','("dead","closed")').maybeSingle()
           : Promise.resolve({ data: null }),
-    email ? supabase.from('isa_leads').select('id,segment,market,outreach_status,first_response_at')
+    email ? supabase.from('isa_leads').select('id,segment,market,outreach_status,first_response_at,sms_opt_out')
               .eq('email', email).not('outreach_status','in','("dead","closed")').maybeSingle()
           : Promise.resolve({ data: null }),
   ]);
   const existing = byPhone ?? byEmail;
+
+  // Independent of the active-lead lookup above (which excludes dead/closed
+  // leads so a genuinely new inbound thread doesn't reopen a stale one):
+  // check ALL history for this phone/email for a prior opt-out. A lead
+  // reaching dead/closed status for any reason must never make a past
+  // opt-out invisible just because a new "lead" row gets created for them.
+  let everOptedOut = !!existing?.sms_opt_out;
+  if (!everOptedOut && (phone || email)) {
+    let optOutQuery = supabase.from('isa_leads').select('id', { count: 'exact', head: true }).eq('sms_opt_out', true);
+    optOutQuery = phone && email
+      ? optOutQuery.or(`phone.eq.${phone},email.eq.${email}`)
+      : phone ? optOutQuery.eq('phone', phone) : optOutQuery.eq('email', email!);
+    const { count } = await optOutQuery;
+    everOptedOut = !!count && count > 0;
+  }
 
   let leadId: string;
   let isNewLead = false;
@@ -86,9 +126,70 @@ serve(async (req) => {
     isNewLead = true;
   }
 
+  // A brand-new lead row for a phone/email that opted out on a prior (now
+  // dead/closed) lead must carry the opt-out forward -- it must never
+  // default to false just because it's a new row.
+  if (isNewLead && everOptedOut && !isOptOutMessage(inbound_message)) {
+    await supabase.from('isa_leads').update({
+      sms_opt_out:    true,
+      sms_opt_out_at: new Date().toISOString(),
+    }).eq('id', leadId);
+  }
+
   const effectiveSegment = (existing?.segment ?? segment) as string;
   const effectiveMarket  = (existing?.market  ?? market)  as string;
   const alreadyResponded = !!(existing?.first_response_at);
+  const alreadyOptedOut  = everOptedOut;
+
+  // Opt-out handling comes before anything else -- no Claude call, no
+  // cadence engagement, just record it and send the one confirmation
+  // message carriers expect for a STOP reply.
+  if (isOptOutMessage(inbound_message)) {
+    // Deliberately NOT setting outreach_status to 'dead'/'closed' here: the
+    // existing-lead lookup above excludes those statuses, which would make
+    // a second contact from this same phone/email look like a brand-new
+    // lead with sms_opt_out defaulted back to false -- silently bypassing
+    // the whole point of this check. sms_opt_out is the durable record;
+    // outreach_status is left alone so this lead stays findable.
+    await supabase.from('isa_leads').update({
+      sms_opt_out:      true,
+      sms_opt_out_at:   new Date().toISOString(),
+      updated_at:       new Date().toISOString(),
+    }).eq('id', leadId);
+
+    const { data: touchNum } = await supabase.rpc('next_touch_number', { p_lead_id: leadId });
+    await supabase.from('lead_touches').insert({
+      lead_id:      leadId,
+      touch_number: touchNum ?? 1,
+      channel,
+      outcome:      'not_interested',
+      notes:        `Opt-out received via inbound message: "${(inbound_message ?? '').slice(0, 120)}"`,
+      isa_name:     'InRange Auto',
+      touched_at:   new Date().toISOString(),
+    });
+
+    let confirmSent = false;
+    if (phone) confirmSent = await sendSms(phone, "You've been unsubscribed and won't receive further messages from InRange.");
+
+    return json({ success: true, lead_id: leadId, is_new_lead: isNewLead, opted_out: true, sms_sent: confirmSent });
+  }
+
+  // A lead who already opted out gets no further automated SMS, ever,
+  // regardless of what they text next -- that requires a documented,
+  // explicit re-consent action, not an inference from a new inbound message.
+  if (alreadyOptedOut) {
+    const { data: touchNum } = await supabase.rpc('next_touch_number', { p_lead_id: leadId });
+    await supabase.from('lead_touches').insert({
+      lead_id:      leadId,
+      touch_number: touchNum ?? 1,
+      channel,
+      outcome:      'no_answer',
+      notes:        `Inbound message from opted-out lead (not auto-responded): "${(inbound_message ?? '').slice(0, 120)}"`,
+      isa_name:     'InRange Auto',
+      touched_at:   new Date().toISOString(),
+    });
+    return json({ success: true, lead_id: leadId, is_new_lead: isNewLead, opted_out: true, sms_sent: false, note: 'lead previously opted out; no automated message sent' });
+  }
 
   let claudeResult: ClaudeResult | null = null;
   if (ANTHROPIC_API_KEY) {
@@ -96,22 +197,7 @@ serve(async (req) => {
   }
 
   const smsText = claudeResult?.sms_response ?? fallbackSms(name, effectiveMarket);
-
-  let smsSent = false;
-  if (phone && TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM_NUMBER) {
-    const twilioRes = await fetch(
-      `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Basic ${btoa(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`)}`,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: new URLSearchParams({ To: phone, From: TWILIO_FROM_NUMBER, Body: smsText }).toString(),
-      }
-    );
-    smsSent = twilioRes.ok;
-  }
+  const smsSent = phone ? await sendSms(phone, smsText) : false;
 
   const { data: touchNum } = await supabase.rpc('next_touch_number', { p_lead_id: leadId });
 
