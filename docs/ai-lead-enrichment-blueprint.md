@@ -232,52 +232,66 @@ drives outreach:
 
 ## 6. What this doc does NOT do
 
-- It does not add a Gemini or Vercel dependency to this repo. No SDK, no
-  live `GEMINI_API_KEY`, no `vercel.json` — those land when Phase 1
-  (Gemini) and the CRM-UI open decision (Vercel, see §8) are approved.
-  (`.env.example` documents `GEMINI_API_KEY` as reserved-but-unset, per
-  §9, so it's clear what Phase 1 will need without wiring it up early.)
+- It does not add a Vercel dependency to this repo, and Gemini is wired as
+  code but not as a live capability — `GEMINI_API_KEY` remains unset (see
+  §11). No `vercel.json` — that lands only if/when the CRM-UI open
+  decision (§8) resolves toward a Vercel app.
 - It does not modify `ingest-nyc`, `ingest-nj`, `score-properties`, or the
   existing `enrich-ai` function. The current pipeline keeps running
-  unchanged; `lead_records` is populated by a new, separate function once
-  built.
-- It does not implement `lead-classify`, `lead-review`, or
-  `skip-trace-dispatch` as code. Those are Phase 2/3 below.
+  unchanged.
+- It does not implement `skip-trace-dispatch` (Phase 3, still fully open —
+  see §8) or any CRM UI (Phase 4).
+- Outreach send is implemented as a permanent, unconditional refusal, not
+  a stub to fill in later without further review — see §11.
 
 ## 7. Phased rollout
 
-1. **Phase 0 (this change):** additive schema (`lead_records`,
-   `lead_evidence`, `ai_enrichment_runs`, `lead_contacts`,
-   `compliance_playbook`, `lead_workbench` view). No pipeline changes.
-2. **Phase 1:** `lead-classify` Edge Function (Gemini) that backfills
-   `lead_records`/`lead_evidence` for existing `properties` rows above
-   Tier 3, following the `enrich-ai` function's conventions (service-role
-   client, Make.com-triggered, batch `limit`). Requires
-   `GEMINI_API_KEY` secret — approval + budget sign-off first.
-3. **Phase 2:** `lead-review` Edge Function (Claude second-pass), triggered
-   for the confidence/conflict/high-value cases in §3. Reuses the existing
-   `ANTHROPIC_API_KEY` secret already in `.env.example`.
+1. **Phase 0 (merged into this PR earlier):** additive schema
+   (`lead_records`, `lead_evidence`, `ai_enrichment_runs`, `lead_contacts`,
+   `compliance_playbook`, `lead_workbench` view).
+2. **Phase 1 (this change):** the API/queue/prompt layer — 15 Edge
+   Functions, the `enrichment_jobs` queue, and the Gemini/Claude prompt
+   contracts. See §11 for what shipped and what's still unverified
+   (principally: no `GEMINI_API_KEY` exists anywhere to actually call
+   Gemini with). Supersedes the originally-planned single `lead-classify`/
+   `lead-review` functions named in earlier drafts of this doc — the
+   JRA-specified endpoint list (`enrichment-gemini-normalize`,
+   `enrichment-gemini-brief`, `enrichment-claude-review`, etc.) is more
+   granular, and this implementation follows that instead.
+3. **Phase 2:** provision `GEMINI_API_KEY`, verify the Gemini/Claude call
+   paths against real traffic, tune `LOW_CONFIDENCE_THRESHOLD` (currently
+   `0.75`, see §11) against real output.
 4. **Phase 3:** `skip-trace-dispatch` wiring to the existing SkipData
    integration (integration details — API shape, auth, rate limits — need
    to be pulled from wherever SkipData is currently configured; not present
    in this repo today).
-5. **Phase 4:** `compliance_playbook` counsel review and agent workbench UI
-   (Retool, matching the existing `leads_dashboard` pattern, or a CRM view
-   if JRA's CRM is Vercel-hosted — needs confirmation, see Open decisions).
+5. **Phase 4:** `compliance_playbook` counsel review, real consent/DNC
+   tracking (required before `outreach-send` can ever be unblocked — see
+   §11), and the agent workbench UI (Retool, matching the existing
+   `leads_dashboard` pattern, or a CRM view if JRA's CRM is Vercel-hosted —
+   needs confirmation, see Open decisions).
 
-## 8. Open decisions (need JRA sign-off before Phase 1+)
+## 8. Open decisions (need JRA sign-off before Phase 2+)
 
-- Confidence-score threshold for routing to Claude second-pass (proposed
-  default: `< 0.75`, tune after real Gemini output is seen).
-- Dollar-value threshold for "high-value tier-1" mandatory review.
+- `LOW_CONFIDENCE_THRESHOLD = 0.75` (in
+  `supabase/functions/_shared/prompts/apply-gemini-output.ts`) is coded
+  and used, but still the same proposed default from earlier drafts of
+  this doc — needs tuning against real Gemini output once
+  `GEMINI_API_KEY` exists.
+- Dollar-value threshold for "high-value tier-1" mandatory Claude review —
+  not implemented; `enrichment-claude-review` currently has to be called
+  explicitly (e.g. by `enrichment-process` claiming a `claude_escalation`
+  job) rather than auto-triggered by a value threshold.
 - Where SkipData is currently integrated (this repo has no existing
   reference to it) and what its API contract looks like.
 - Whether JRA's CRM UI is the existing Retool dashboard, a new Vercel app,
-  or a different system — the brief says "existing CRM/UI conventions in
-  this repository," but no CRM UI code currently exists here beyond the
-  Retool view contract in the README.
+  or a different system — still fully open; no CRM UI code exists in this
+  repo (Phase 1 is API-only).
 - Final compliance-playbook content, from counsel, per category and per
-  state (NY vs. NJ differ materially on foreclosure-related solicitation).
+  state (NY vs. NJ differ materially on foreclosure-related solicitation)
+  — `counsel_reviewed` is still `false` on every seed row.
+- Real consent/opt-in tracking, required before `outreach-send` can ever
+  be unblocked (see §11) — no design proposed yet.
 
 ## 9. Security & Data Handling (non-negotiable)
 
@@ -467,3 +481,102 @@ signals (the categories and mechanisms already in §2/§4 of this doc):
   database. `lead_workbench`'s per-bucket counts (§4) are meant to back an
   actual visual distinction — e.g. different badge colors or icons per
   bucket — not just a number nobody looks at.
+
+## 11. Phase 1 Implementation: API, Queue, and Prompt Contracts
+
+Ships the API/queue/prompt layer specified by JRA on top of Phase 0's
+schema. Two things to be precise about up front, because "implemented"
+can be overstated:
+
+**What was actually verified.** Every SQL statement in
+`20260917200000_enrichment_queue_and_review.sql` — the new enums, columns,
+constraints, the `claim_enrichment_job` function, `raw_records`,
+`enrichment_jobs`, `lead_review_actions`, `lead_feedback`,
+`outreach_drafts`, and the `review_queue` view — was run against a local
+Postgres 16 instance, including the exact INSERT/UPDATE shapes every new
+Edge Function issues (idempotency conflicts, the atomic job-claim's
+concurrency behavior, the approve/reject supersede pattern, the rejected-
+state CHECK constraints). Every `.ts` file (14 new Edge Functions plus 5
+new `_shared` modules) was typechecked with `tsc --strict` against a
+hand-written Deno shim, cross-checked by running the same checker over the
+repo's existing deployed functions to confirm it doesn't flag things Deno
+itself wouldn't. That check caught two real bugs before they shipped: a
+JSDoc comment containing a literal `*/` that would have corrupted a whole
+prompt-builder file, and (carried over from Phase 0's own review) the
+`needs_human_review`-under-cover-of-`is_current` mutation gap, closed here
+properly with a jsonb-diff refactor instead of a manually-maintained
+column whitelist (see the migration's "Trigger hardening" section).
+
+**What was not verified: any actual Gemini or Claude API call.** No Deno
+runtime exists in this environment (no `deno` binary, and the network
+proxy returned 403 on the installer), and `GEMINI_API_KEY` is not
+provisioned anywhere — it remains deliberately reserved-but-unset in
+`.env.example`, per the Phase 2 gate in §7. `enrichment-gemini-normalize`,
+`enrichment-gemini-brief`, and `enrichment-claude-review` are code-complete
+and typecheck cleanly, but the actual HTTP calls to
+`generativelanguage.googleapis.com` and the Anthropic API were never
+exercised. Treat that code as reviewed-but-untested until Phase 2.
+
+### What shipped
+
+- **Schema:** `raw_records` (staging for `POST /ingest/raw-record`),
+  `enrichment_jobs` (the 8-job-type queue, with `claim_enrichment_job`
+  doing atomic `FOR UPDATE SKIP LOCKED` claiming — a plain
+  select-then-update from application code would race under concurrent
+  `enrichment-process` invocations), `lead_review_actions` (the
+  approve/reject/edit/request-more-research audit log),
+  `lead_feedback` (the 10 agent-feedback categories), `outreach_drafts`,
+  and a `rejected` confidence value with its own
+  `ai_extraction_never_rejected` CHECK — symmetric with Phase 0's
+  `ai_extraction_never_confirmed_fact`: an AI model can flag a claim as
+  dubious, but only a human review action can formally reject or confirm
+  one.
+- **15 Edge Functions:** `ingest-raw-record`, `enrichment-queue`,
+  `enrichment-process` (the job dispatcher — claims a job, dispatches by
+  `job_type`, marking `document_extraction` jobs immediately dead-lettered
+  with a clear "not implemented" error rather than silently no-opping,
+  since no document/Storage pipeline exists in this repo),
+  `enrichment-retry`, `enrichment-gemini-normalize`,
+  `enrichment-gemini-brief`, `enrichment-claude-review`,
+  `lead-intelligence` (GET), `lead-request-review`,
+  `lead-approve-ai-suggestion`, `lead-reject-ai-suggestion`,
+  `outreach-draft`, `outreach-approve`, `outreach-send`, and
+  `leads-feedback` (not in the original endpoint list, but "store
+  [agent] feedback for later prompt and rule evaluation" needs an
+  endpoint to land on, so one was added).
+- **`outreach-send` is a permanent refusal, not a stub.** Per the
+  instruction not to implement send behavior until consent/approval
+  controls are verified: it always returns `403` naming the specific
+  reasons (no consent/opt-in table exists at all, `lead_contacts.dnc_flag`
+  is never read by any code path, every `compliance_playbook` row is
+  still `counsel_reviewed = false`). Approving a draft
+  (`outreach-approve`) does not change this — approval and consent
+  verification are different gates.
+- **Prompt contracts** in `supabase/functions/_shared/prompts/`:
+  `gemini-enrichment.ts` carries the JRA-specified system instruction and
+  response schema verbatim; `claude-escalation.ts` carries Claude's system
+  instruction verbatim, but its response JSON schema is this repo's own
+  design (the spec gave Claude's instruction without an explicit schema —
+  flagged in the file itself for JRA sign-off before Phase 2). Both are
+  versioned (`GEMINI_PROMPT_VERSION`, `CLAUDE_ESCALATION_PROMPT_VERSION`)
+  and every `ai_enrichment_runs` row records which version produced it.
+- **A deliberate mapping decision worth knowing about:** Gemini's own
+  response schema calls one of its output buckets `confirmed_facts` — but
+  those are never written as new `lead_evidence` rows (they're Gemini's
+  reflection of facts already in its input, and an AI model is never
+  allowed to author a `confirmed_fact` row regardless of what it calls
+  itself). Gemini's `source_supported_signals` are written to
+  `lead_evidence`, but at `confidence = 'hypothesis'`, not
+  `'source_supported_signal'` — this repo's confidence taxonomy is a
+  statement about what our system trusts, not a pass-through of a model's
+  own label for its output. See
+  `supabase/functions/_shared/prompts/apply-gemini-output.ts` for the full
+  reasoning.
+- **`outreach-draft` never calls an LLM.** No prompt contract was
+  specified for outreach copy generation, and per §9, a model call needing
+  contact-adjacent context should be "a distinct, explicitly-scoped call,"
+  not folded into drafting. It templates from the already-vetted
+  `suggested_outreach_angle` (itself constrained by the Gemini prompt
+  contract to be grounded only in confirmed/source-supported evidence)
+  plus the resolved `compliance_playbook` entry, and never reads
+  `lead_contacts` values.
