@@ -54,8 +54,11 @@ Retool Dashboard
 supabase/
   config.toml                       # Supabase CLI config
   migrations/
-    20240101000000_initial_schema.sql        # Tables + RLS + indexes
-    20240101000001_views_and_functions.sql   # Views + SQL helpers
+    20240101000000_initial_schema.sql            # Tables + RLS + indexes
+    20240101000001_views_and_functions.sql       # Views + SQL helpers
+    20240103000000_rename_properties_to_legacy.sql  # legacy_properties rename
+    20240104000000_canonical_data_model.sql      # organizations/raw_records/properties/parties/leads/enrichment_runs
+    20240105000000_enrichment_evidence_and_signals.sql  # enrichment_evidence/ai_signals/contact_points/contact_consent/human_reviews
   functions/
     _shared/
       types.ts                      # Shared TypeScript types
