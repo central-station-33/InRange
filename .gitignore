@@ -1,0 +1,15 @@
+# Secrets — never commit real env files, only .env.example
+.env
+.env.*
+!.env.example
+
+# Supabase local dev
+.branches
+.temp
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Dependency directories (if any function/tooling adds one later)
+node_modules/
