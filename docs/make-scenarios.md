@@ -70,6 +70,25 @@ Or chain it directly with a Sleep module after each ingest:
 
 ---
 
+## 3b — Process Raw Records (Trigger: after Ingest NYC or NJ completes)
+
+Runs in parallel with scenario 3, on the same trigger — `process-raw-records`
+reads from `raw_records` (which ingest-nyc/ingest-nj now dual-write into
+alongside `legacy_properties`), not from anything scenario 3 produces, so
+there's no ordering dependency between the two. See
+`docs/canonical-data-model.md` for what this feeds (and doesn't feed yet).
+
+```
+[Webhook — triggered by scenario 1 or 2 on success]
+  └─▶ HTTP POST → process-raw-records
+        Body: { "limit": 200 }
+  └─▶ [Router]
+        success: Log processed / failed counts
+        error:   Alert admin
+```
+
+---
+
 ## 4 — AI Enrichment (Schedule: Daily, 6 AM ET)
 
 Runs after scoring. Gemini runs first-pass on every Tier 1–2 property;

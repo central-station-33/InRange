@@ -13,6 +13,8 @@
  */
 
 import { getServiceClient, jsonResponse, verifyMakeSecret } from '../_shared/supabase-client.ts';
+import { currentOrganizationId } from '../_shared/organization.ts';
+import { insertRawRecord } from '../_shared/rawRecords.ts';
 import type { DistressFlag, Property } from '../_shared/types.ts';
 
 // NJOGIS ArcGIS REST — MOD-IV parcel layer (statewide, public)
@@ -197,6 +199,27 @@ Deno.serve(async (req) => {
       upserted += batch.length;
     }
 
+    // 4) Also write into the canonical ingestion layer (raw_records) —
+    // additive, legacy_properties above stays the source of truth for the
+    // existing pipeline. process-raw-records turns these into canonical
+    // properties/parties/leads.
+    const organizationId = currentOrganizationId();
+    const rawRecordErrors: string[] = [];
+    for (const prop of properties) {
+      try {
+        await insertRawRecord(supabase, {
+          organization_id: organizationId,
+          source_name: 'nj',
+          source_record_id: prop.parcel_id,
+          source_type: 'public_record',
+          ingestion_batch_id: runId,
+          raw_payload_json: prop,
+        });
+      } catch (e) {
+        rawRecordErrors.push(`raw_records ${prop.parcel_id}: ${(e as Error).message}`);
+      }
+    }
+
     await supabase.from('ingestion_runs').update({
       status: 'completed',
       completed_at: new Date().toISOString(),
@@ -204,7 +227,12 @@ Deno.serve(async (req) => {
       records_upserted: upserted,
     }).eq('id', runId);
 
-    return jsonResponse({ success: true, records_fetched: properties.length, records_upserted: upserted });
+    return jsonResponse({
+      success: true,
+      records_fetched: properties.length,
+      records_upserted: upserted,
+      raw_record_errors: rawRecordErrors,
+    });
   } catch (err) {
     const msg = (err as Error).message;
     await supabase.from('ingestion_runs').update({

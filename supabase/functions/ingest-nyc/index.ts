@@ -9,6 +9,8 @@
  */
 
 import { getServiceClient, jsonResponse, verifyMakeSecret } from '../_shared/supabase-client.ts';
+import { currentOrganizationId } from '../_shared/organization.ts';
+import { insertRawRecord } from '../_shared/rawRecords.ts';
 import type { DistressFlag, Property } from '../_shared/types.ts';
 
 const APP_TOKEN = Deno.env.get('NYC_OPEN_DATA_APP_TOKEN') ?? '';
@@ -213,6 +215,27 @@ Deno.serve(async (req) => {
       upserted += batch.length;
     }
 
+    // Also write into the canonical ingestion layer (raw_records). This is
+    // additive — legacy_properties above remains the source of truth for
+    // the existing score/enrich/notify pipeline. process-raw-records turns
+    // these into canonical properties/parties/leads.
+    const organizationId = currentOrganizationId();
+    const rawRecordErrors: string[] = [];
+    for (const prop of taxLiens) {
+      try {
+        await insertRawRecord(supabase, {
+          organization_id: organizationId,
+          source_name: 'nyc',
+          source_record_id: prop.parcel_id,
+          source_type: 'public_record',
+          ingestion_batch_id: runId,
+          raw_payload_json: prop,
+        });
+      } catch (e) {
+        rawRecordErrors.push(`raw_records ${prop.parcel_id}: ${(e as Error).message}`);
+      }
+    }
+
     await supabase.from('ingestion_runs').update({
       status: 'completed',
       completed_at: new Date().toISOString(),
@@ -220,7 +243,12 @@ Deno.serve(async (req) => {
       records_upserted: upserted,
     }).eq('id', runId);
 
-    return jsonResponse({ success: true, records_fetched: taxLiens.length, records_upserted: upserted });
+    return jsonResponse({
+      success: true,
+      records_fetched: taxLiens.length,
+      records_upserted: upserted,
+      raw_record_errors: rawRecordErrors,
+    });
   } catch (err) {
     const msg = (err as Error).message;
     await supabase.from('ingestion_runs').update({
