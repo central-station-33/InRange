@@ -27,6 +27,15 @@ ALTER TABLE public.isa_leads
   ADD COLUMN IF NOT EXISTS module    TEXT CHECK (module IS NULL OR module = ANY (ARRAY['distressed_investor', 'residential_sale', 'rental_leasing'])),
   ADD COLUMN IF NOT EXISTS lead_role TEXT CHECK (lead_role IS NULL OR lead_role = ANY (ARRAY['buyer', 'seller', 'investor', 'renter', 'landlord', 'referral_partner']));
 
+-- 'landlord' added as a valid segment for the new ingest-rental-landlord-leads
+-- function (writes isa_leads.segment = 'landlord').
+ALTER TABLE public.isa_leads DROP CONSTRAINT IF EXISTS isa_leads_segment_check;
+ALTER TABLE public.isa_leads ADD CONSTRAINT isa_leads_segment_check
+  CHECK (segment = ANY (ARRAY[
+    'athlete', 'expat_relocation', 'investor', 'film_tv', 'motivated_seller',
+    'first_time_buyer', 'divorce', 'empty_nester', 'developer', 'homeowner',
+    'renter', 'general_inquiry', 'landlord']));
+
 ALTER TABLE public.content_queue
   ADD COLUMN IF NOT EXISTS linked_rental_unit_id UUID REFERENCES public.rental_units(id);
 
