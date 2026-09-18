@@ -52,6 +52,35 @@ partial/manual exports and may not reflect the ~18 currently-active scenarios
 in the `us2.make.com` team. Treat Make.com itself as the source of truth for
 scenario logic; this repo only tracks the edge functions those scenarios call.
 
+## Access roles: broker / agent
+
+`team_agents` now has `role` (`agent` | `broker`, defaults to `agent`) and
+`auth_user_id` (links a row to a Supabase Auth login). RLS on
+`isa_leads`/`deals`/`lead_touches`/`team_agents`/`agent_routing_rules`/
+`relocation_partners` is scoped accordingly — brokers see everything,
+agents see only rows where `assigned_agent_id` matches their own
+`team_agents.id`. See `supabase/migrations/20260918030000_broker_agent_roles.sql`
+for exactly what's scoped and what's deliberately left broad (shared
+property inventory).
+
+**Nobody is linked yet.** The one existing `team_agents` row (James
+Thompson) has `auth_user_id = NULL`, and the one Supabase Auth login
+present (`team@joinjra.com`) doesn't match his email — left unlinked
+rather than guessed. Once you've confirmed which login is actually his
+(or created one for him), link and promote with:
+
+```sql
+UPDATE team_agents
+SET auth_user_id = '<the auth.users.id for his login>', role = 'broker'
+WHERE id = '8d459409-696f-4c17-a78e-2acd28f9ac54';
+```
+
+Until that runs, no Supabase Auth session resolves to any agent/broker
+identity — `current_team_agent_id()` and `is_broker()` both return
+false/null, so an authenticated-but-unlinked login sees none of the
+scoped tables above. This doesn't affect the live pipeline: every edge
+function writes with the service-role key, which bypasses RLS entirely.
+
 ## What's actually in the database
 
 18 tables (see `supabase/migrations/20260917120000_baseline_snapshot_from_production.sql`
