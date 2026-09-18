@@ -63,23 +63,25 @@ agents see only rows where `assigned_agent_id` matches their own
 for exactly what's scoped and what's deliberately left broad (shared
 property inventory).
 
-**Nobody is linked yet.** The one existing `team_agents` row (James
-Thompson) has `auth_user_id = NULL`, and the one Supabase Auth login
-present (`team@joinjra.com`) doesn't match his email — left unlinked
-rather than guessed. Once you've confirmed which login is actually his
-(or created one for him), link and promote with:
+**James Thompson (`8d459409-696f-4c17-a78e-2acd28f9ac54`) is linked as
+`broker`**, tied to the `team@joinjra.com` Supabase Auth login (his
+`team_agents.email` was updated to match — confirmed 2026-09-18). Verified
+directly: under that login, `current_team_agent_id()` resolves to his
+agent id and `is_broker()` returns `true`.
+
+To add another agent later: create their Supabase Auth login, then
 
 ```sql
 UPDATE team_agents
-SET auth_user_id = '<the auth.users.id for his login>', role = 'broker'
-WHERE id = '8d459409-696f-4c17-a78e-2acd28f9ac54';
+SET auth_user_id = '<their auth.users.id>'   -- role defaults to 'agent'; leave it unless they're also a broker
+WHERE id = '<their team_agents.id>';
 ```
 
-Until that runs, no Supabase Auth session resolves to any agent/broker
-identity — `current_team_agent_id()` and `is_broker()` both return
-false/null, so an authenticated-but-unlinked login sees none of the
-scoped tables above. This doesn't affect the live pipeline: every edge
-function writes with the service-role key, which bypasses RLS entirely.
+Until a `team_agents` row is linked this way, that login resolves to no
+agent/broker identity — `current_team_agent_id()`/`is_broker()` return
+null/false, so it sees none of the scoped tables. Doesn't affect the live
+pipeline either way: every edge function writes with the service-role key,
+which bypasses RLS entirely.
 
 ## What's actually in the database
 
