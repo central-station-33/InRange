@@ -1,80 +1,86 @@
 # Data Sources
 
-## New York City
+Rewritten 2026-09-17 by reading the dataset URLs directly out of the live
+edge function source in `supabase/functions/` (pulled from production —
+see the repo README). Previous versions of this doc described datasets that
+are no longer referenced anywhere in the code; if you find another mismatch,
+trust the source code over this file and fix this file.
 
-All NYC sources are free via NYC Open Data (Socrata API).
-Register for an app token at https://data.cityofnewyork.us/profile/app_tokens
-to raise the default rate limit from 1,000 to 50,000 rows/day.
+## New York City (NYC Open Data / Socrata)
 
-| Signal | Dataset | Socrata ID | ingest-nyc field |
-|---|---|---|---|
-| Tax Lien | NYC DOF Tax Lien Sale | `9rz4-mjeg` | `distress_flags[].type = "tax_lien"` |
-| Code Violations | HPD Building Complaints | `uwyv-629c` | `distress_flags[].type = "code_violation"` |
-| Foreclosure | ACRIS Lis Pendens | `2p6d-qhgr` | `distress_flags[].type = "foreclosure"` |
+All calls are **unauthenticated** — no `NYC_OPEN_DATA_APP_TOKEN` is set or
+read by any function, so requests run against Socrata's default (lower) rate
+limit. Register an app token at
+https://data.cityofnewyork.us/profile/app_tokens if ingestion starts hitting
+429s.
+
+| Dataset | Socrata ID | Used by |
+|---|---|---|
+| HPD Violations | `wvxf-dwi5` | `ingest-nyc`, `nyc-diag` |
+| NYC Evictions | `6z8x-wfk4` | `ingest-nyc` |
+| HPD Registration Contacts | `feu5-w2e2` | `ingest-nyc` |
+| PLUTO (parcel/zoning reference) | `64uk-42ks` | `ingest-nyc`, `nyc-diag`, `coop-diag` |
+| DOF Property Valuation | `yjxr-fw8i` | `ingest-nyc` |
+| ACRIS Real Property Legals | `8h5j-fqxa` | `ingest-nyc`, `ingest-acris-investors`, `nyc-diag` |
+| ACRIS Real Property Master | `bnx9-e6tj` | `ingest-nyc`, `ingest-acris-investors`, `nyc-diag` |
+| ACRIS Real Property Parties | `636b-3b5g` | `ingest-acris-investors` |
+
+**No NYC DOF Tax Lien Sale dataset is currently ingested** (previously
+documented as `9rz4-mjeg` — not present anywhere in the current codebase).
+The `tax_lien` scoring signal is now derived only from NJ MOD-IV
+`delinquent_amount` (see `_shared/scoring.ts` in `score-property` /
+`rescore-properties` / `process-raw-properties` — `tax_lien` fires when
+`delinquent_amount > 5000`). If NYC tax-lien coverage matters, it needs to be
+added back, not assumed to exist.
+
+There's a dedicated `probe-acris-lis-pendens` function (5 lines) — check it
+directly if you need current lis-pendens handling; it's too small to
+characterize confidently here without risking going stale again.
 
 ### Property ID format (BBL)
-NYC uses Borough-Block-Lot (BBL): `{1-digit borough}{5-digit block}{4-digit lot}`
-- Borough 1 = Manhattan, 2 = Bronx, 3 = Brooklyn, 4 = Queens, 5 = Staten Island
-- This is stored as `properties.parcel_id` for NYC records.
-
-### Useful additional NYC datasets (not yet implemented)
-- **DOF Property Valuation** (`rgy2-tti8`) — assessed vs market value trends
-- **HPD Violations** (`wvxf-dwi5`) — more granular than complaints
-- **NYC Probate (Surrogate's Court)** — no open API; would require scraping NYSCEF
-
----
+NYC uses Borough-Block-Lot (BBL): `{1-digit borough}{5-digit block}{4-digit lot}`.
+Borough 1 = Manhattan, 2 = Bronx, 3 = Brooklyn, 4 = Queens, 5 = Staten Island.
 
 ## New Jersey
 
-### MOD-IV (Municipal Tax Data)
-New Jersey's statewide property tax database. Published quarterly by the
-NJ Division of Taxation and exposed through NJOGIS as an ArcGIS Feature Service.
+**There are three different NJ ArcGIS endpoints in use across different
+functions** — this looks like drift, not intentional design, and is worth
+consolidating rather than treating as settled:
 
-- **NJOGIS ArcGIS REST endpoint:**
-  `https://services2.arcgis.com/XVOqAjTOJ5P6ngMu/arcgis/rest/services/MOD4_Assessment_Statewide/FeatureServer/0/query`
-- **Authentication:** None (public)
-- **Key fields:** `PAMS_PIN`, `OWNER`, `PROPERTY_LOCATION`, `MUN_NAME`,
-  `TOTAL_ASSESS`, `DELINQUENT_TAXES`, `YEARS_DELINQUENT`
-
-Currently `ingest-nj` fetches only properties with `DELINQUENT_TAXES > 0`.
-To expand coverage, remove that filter and apply scoring post-ingest.
-
-### Sheriff Sales
-NJ sheriff sales are conducted at the county level with no centralised API.
-
-**Recommended approach (Make.com):**
-Build one HTTP module per county that fetches the county sheriff's sale list,
-parses the HTML/CSV, and POSTs the rows in the `sheriff_sales` array to `ingest-nj`.
-
-Priority counties and their sheriff sale pages:
-
-| County | Population | Sheriff Sale URL |
+| Endpoint | FeatureServer | Used by |
 |---|---|---|
-| Hudson | 672k | https://www.hudsoncountysheriff.com/sheriff-sales |
-| Essex | 858k | https://www.essexsheriff.com/sheriff-sales |
-| Bergen | 958k | https://www.bcso.us/services/sheriff-sales |
-| Middlesex | 863k | https://www.middlesexcountysheriff.com |
-| Passaic | 507k | https://www.passaicsheriff.com |
-| Union | 576k | https://www.ucnj.org/sheriff |
-| Mercer | 377k | https://www.mercercountysheriff.org |
-| Camden | 523k | https://www.camdencounty.com/service/sheriff |
+| `services2.arcgis.com/XVOqAjTOJ5P6ngMu/.../Parcels_MODIV_NJ_WM/FeatureServer/0` | Parcels_MODIV_NJ_WM | `ingest-nj` |
+| `services2.arcgis.com/XVOqAjTOJ5P6ngMu/.../Parcels_and_MOD_IV_Composite/FeatureServer/0` | Parcels_and_MOD_IV_Composite | `burnt-out-landlord-scan` |
+| `data.nj.gov/resource/w9se-dmra.json` | (Socrata-style, not ArcGIS) | `ingest-nj-developer-leads` (NJ building permits) |
 
-### NJ Lis Pendens
-NJ lis pendens are filed with the county clerk and are not centralised.
-The NJ Courts ACMS public portal has a case search at:
-https://portal.njcourts.gov/webe4/ExternalPaperSearchWebPortal/pages/
+**Authentication:** none required for any of the three.
 
-This would require browser automation (Make.com + Apify or a custom scraper).
-Not implemented in the current version.
+Sheriff sales and NJ lis pendens are not centralized/API-accessible (still
+true as of this rewrite) — no automated ingestion path exists in the current
+edge functions for either; if a Make.com scenario handles county-by-county
+sheriff-sale scraping, it isn't reflected in this repo.
 
----
+## Skip Tracing
 
-## Data Freshness
+`skip-trace-leads` calls out to **DataSkip** (`DATASKIP_API_KEY`), gated by
+the `skip_trace_confirmations` table — a token issued before the call is
+consumed once, preventing accidental repeat paid lookups. `anon` and
+`authenticated` roles are explicitly denied all access to that table
+(`deny_all_client_access` policy); only the service role can read/write it.
 
-| Source | Update Frequency | ingest-nyc trigger |
-|---|---|---|
-| NYC Tax Lien | Annual (spring) | Daily — new liens appear incrementally |
-| NYC HPD Complaints | Real-time | Daily |
-| ACRIS Lis Pendens | Real-time | Daily |
-| NJ MOD-IV | Quarterly | Daily (no-ops when unchanged) |
-| NJ Sheriff Sales | Weekly (county sites) | Daily |
+## ARV / Comps
+
+`estimate-arv-comps` calls **SimplyRETS** (`SIMPLYRETS_API_KEY` /
+`SIMPLYRETS_API_SECRET`) for real sold-MLS comparables. Results land in
+`properties.estimated_arv` with `arv_source = 'comps'` and
+`arv_comp_method` recording whether it used `price_per_sqft` or
+`median_sold_price`. `arv_source = 'ai_refined'` means a Claude call
+(`enrich-property`) adjusted the comps-based estimate instead — but see the
+README: `enrich-property` is currently deployed empty, so treat
+`ai_refined` rows with suspicion until that's resolved.
+
+## Notes on staleness
+
+This file reflects what the code does as of 2026-09-17. It will go stale the
+same way the last version did unless changes to `supabase/functions/*/source
+are accompanied by an update here in the same commit.
