@@ -34,28 +34,53 @@ this session.
 > and a partial unique index now makes the duplicate class impossible
 > (section 4.4). Fixing the key also exposed a new, separate defect in the
 > routing the ISA acts on — section 4.7, which is open.
+>
+> **Re-run, ~22:50 UTC.** Live re-check of every claim in this report against
+> current production state, four sections changed:
+> - Enrichment kept running after the last revision: all 162 current leads
+>   now carry an `ai_summary` (was 75), $1.11 of $15 spent, not paused.
+> - Assignment is corrected, not just updated: the "no routing rule, 432
+>   unassigned" finding in 4.5 was accurate when written and is **wrong now**
+>   — a wildcard rule was added to `agent_routing_rules` since, and all 162
+>   leads are assigned. Section 4.5 marks this as a correction rather than
+>   silently changing the number.
+> - The routing-derivation bug (4.7) is confirmed at full scale on live data:
+>   19 of 162 violate the prompt's own rules (11.7%), matching the earlier
+>   12% estimate from a smaller, backup-inclusive sample. Still not fixed,
+>   still not authorised.
+> - Notification is now the whole story: `lead_touches` and
+>   `notification_log` are both 0 against 162 enriched, assigned leads. This
+>   is the actual bottleneck as of this revision, not enrichment or
+>   assignment.
+>
+> Separately, the ops-reduction work from earlier today (S19, S1b, S1c, S1d)
+> is Make/Supabase configuration, not a repo change, and isn't detailed here;
+> see the PR conversation for that trail.
 
 ---
 
 ## 1. Bottom line
 
-The pipeline ingests, and as of ~19:20 UTC on 2026-09-21 the Anthropic
-enrichment path works. Everything downstream of enrichment — routing,
-assignment, notification, delivery — still does not.
+**Re-verified live at ~22:50 UTC**, roughly four hours after the previous
+revision. The pipeline now enriches and assigns everything it ingests. It
+still delivers nothing to an ISA: 162 leads are enriched, scored, and
+assigned, and `lead_touches`/`notification_log` are both 0. That gap —
+not enrichment, not assignment — is now the single blocker between a
+working backend and an ISA doing anything with it.
 
 | Stage | Status | Evidence |
 |---|---|---|
-| Property ingestion (NYC HPD, evictions, NJ MOD-IV) | Working, last run 2026-09-14 | 879 raw rows, 915 properties, 0 unprocessed |
+| Property ingestion (NYC HPD, evictions, NJ MOD-IV) | Working, scheduled daily 07:00–08:30 ET | 900 raw rows as of 22:46 UTC (was 879). S1b/S1c/S1d moved to a daily schedule and re-verified live today; see §7 and the PR notes on the Route A ops work. |
 | ISA lead ingestion (ACRIS divorce, empty-nester, developer) | Working; duplicates cleaned and now blocked at the DB | Table deduplicated 627 → 162 rows, 465 removed to a backup table, partial unique index applied and guard-tested. The `.or()` filter in `ingest-leads` is still unfixed — the index is what holds the line. See 4.4. |
 | AI enrichment, Anthropic path (`enrich-leads`, `enrich-pending`) | **Working** (as of 2026-09-21 ~19:20 UTC) | Live call returned `enriched: 1`, 358 input / 596 output tokens, and wrote `ai_summary`, BANT and routing to a real lead. The 401 was a bad key string, fixed on the third replacement. See 4.1. |
-| AI enrichment, Gemini path (S2 via `list-pending-enrichment` → `write-enrichment`) | **Blocked on billing** | All 50 `write-enrichment` calls in the 16:14–16:22 run returned **422**, caused by an empty Gemini prepay balance the `Resume` handler masked. Top-up pending as of 18:40 UTC. The response mapping remains unproven. See 4.2. |
-| Lead assignment (`assign-leads`) | Working for 5 of 8 active segments | 195 leads assigned, all to the one agent. `divorce`, `empty_nester`, `homeowner`, `landlord` have no routing rule, so 432 leads sit unassigned. |
-| ISA notification (`notify-isa` → Make receiver) | Idle, not proven | Every run today ends `no_leads_matched` because no lead has both `ai_summary` and `outreach_status='new'`. The receiver scenario only logs a touch; it sends no SMS or email. |
+| AI enrichment, Gemini path (S2 via `list-pending-enrichment` → `write-enrichment`) | **Blocked on billing, status unchanged** | All 50 `write-enrichment` calls in the 16:14–16:22 run returned **422**, caused by an empty Gemini prepay balance the `Resume` handler masked. Top-up pending as of 18:40 UTC, not re-checked since. The response mapping remains unproven. See 4.2. |
+| Lead assignment (`assign-leads`) | **Working — 100% of current leads assigned** | Re-checked live: all 162 leads carry `assigned_agent_id`, all to the sole agent. A wildcard rule (`segment: null`, priority 99) added to `agent_routing_rules` since the original finding catches everything the 11 named rules don't. See revised 4.5 — the original "no rule, 432 unassigned" claim is corrected there, not deleted. |
+| ISA notification (`notify-isa` → Make receiver) | **Idle — now the binding constraint** | Re-checked live: `lead_touches` and `notification_log` are both 0 rows, same as before, but now against 162 fully-enriched, fully-assigned leads rather than mostly-unenriched ones. The receiver scenario only logs a touch; it sends no SMS or email. This is the next thing to fix. |
 | Inbound lead fast response (S16 → `respond-lead`) | **Broken** | Last two real inbound events (2026-09-17) failed with `BundleValidationError` before reaching the edge function. |
 | Inbound SMS (S18) and email parser (S17) | Never executed | Both active since 2026-09-06 with zero runs. |
-| Follow-up cadence (`follow-up-cadence`) | Not scheduled | The only scenario that calls it (ISA S19) is inactive and marked invalid. |
+| Follow-up cadence (`follow-up-cadence`) | Not scheduled | The only scenario that calls it, **ISA S19 – Follow-up Cadence** (id 5094961), is inactive and marked invalid. Note the name collision: this is a different scenario from **ISA S19: High-Value Homeowner Bridge** (id 6187369), which is active and was moved from 35 ops/run to 1 today — see §7. Worth renaming one of them before it causes a wrong-scenario mistake. |
 | Skip trace (DataSkip) | Wired, spend gated | 2 confirmations issued, 2 leads matched, 18 no-match. Two-step approval gate works as designed. |
-| AI routing (`bant_score` → `routing`) | **Broken, and it was broken before the key was fixed** | 21 of 172 enriched rows carry a `routing` that contradicts the prompt's own stated rules, including identical rows that got both `cold` and `nurture`. `enrich-leads` trusts the model's `routing` string instead of deriving it. See 4.7. |
+| AI routing (`bant_score` → `routing`) | **Broken, confirmed at full scale, still not fixed** | Re-checked against all 162 current leads (up from the 172-row sample that included dedupe-backup rows): 143 agree with the prompt's own stated rules, **19 violate them (11.7%)** — consistent with the original 12% estimate, not a fluke of the smaller sample. `enrich-leads` still trusts the model's `routing` string instead of deriving it from `bant_score`. See 4.7. Not authorised for a code fix as of this revision. |
 | Dashboard / login | **Does not exist in production** | See section 6. |
 
 Confidence: Verified for every row except cadence scheduling (Likely; the
@@ -458,16 +483,39 @@ the key started working. **Verified from the backup.**
 
 ### 4.5 Assignment and notification
 
-- `agent_routing_rules` has 11 rows covering `athlete`, `investor`,
-  `expat_relocation`, `film_tv`, `developer` for NYC and NJ. No rule for
-  `divorce`, `empty_nester`, `homeowner`, `landlord`, `renter`,
-  `general_inquiry`. The three segments being ingested today therefore
-  never get an agent and never appear in an agent's scoped view. **Verified.**
-- The Notify Receiver scenario failed 11 times on 2026-09-07 with
+**CORRECTION, 2026-09-21 ~22:50 UTC.** This section originally said no rule
+covered `divorce`, `empty_nester`, `homeowner`, `landlord` and that those
+leads therefore never got an agent. Re-checked live and that is no longer
+true, and the mechanism is worth recording. `agent_routing_rules` now has 11
+named rows (`athlete`, `investor`, `expat_relocation`, `film_tv`, `developer`
+× NYC/NJ) **plus a catch-all row added since**: `segment: null, market: null,
+priority: 99, max_active_leads: 500`. `assign-leads` matches a rule when
+`r.segment === null OR r.segment === lead.segment`, so that row matches
+everything nothing else claims. Result, checked directly against
+`isa_leads`: **all 162 current leads are assigned**, all to the same person
+(`assigned_agent_id = 8d459409-...`) — unsurprising, since `team_agents` has
+exactly one row. The original finding wasn't fabricated — it was true when
+written and the wildcard rule was added afterward — but it's stale now, and
+leaving it uncorrected would send someone chasing a problem that no longer
+exists. **Verified**, by direct query.
+
+What the wildcard doesn't fix: it's a single-agent stopgap. The moment a
+second agent exists, every unnamed segment (`divorce`, `empty_nester`,
+`homeowner` among them) funnels to whichever agent this rule points at,
+priority 99, regardless of who should actually own it. Named rules per
+segment are still the correct fix before hiring; noting it here so it
+doesn't get re-discovered as a surprise later.
+
+- **Notification is still where it was.** `lead_touches` and
+  `notification_log` are both 0 rows, checked live — same as originally
+  reported. 162 leads are now enriched and assigned and **not one has been
+  touched.** The Notify Receiver scenario failed 11 times on 2026-09-07 with
   `Validation failed for 7 parameter(s)` (the email/SMS modules that existed
   then). It has since been cut down to a single `log-touch` call. There is
   currently **no delivery channel** for ISA notifications: no SMS, no email,
-  no Slack. **Verified from blueprint.**
+  no Slack. This is now the single largest gap between "the pipeline works"
+  and "an ISA does anything with it." **Verified from blueprint and live
+  counts.**
 
 ---
 
@@ -594,7 +642,7 @@ Two related notes on the same write path:
 |---|---|---|
 | `properties` | 915 | 49 Tier 1 pending enrichment since 2026-09-08; 0 complete; 3 quarantined. 592 of 915 have no ARV. |
 | `raw_properties` | 879 | All processed. 12 rows are diagnostics. |
-| `isa_leads` | 162 (was 627) | Deduplicated 2026-09-21; 465 rows moved to `isa_leads_dedupe_backup_20260921`. 75 have an `ai_summary`. Contact coverage remains the binding constraint: almost none carry a phone or email, so enrichment quality cannot compensate for having no way to reach the person. |
+| `isa_leads` | 162 (was 627) | Deduplicated 2026-09-21; 465 rows moved to `isa_leads_dedupe_backup_20260921`. **All 162 now have an `ai_summary`** (up from 75 at ~19:30 UTC — a further enrichment run completed 19:20–20:28 UTC, $1.11 of the $15/month Anthropic budget spent, not paused). All 162 are also assigned (§4.5). Contact coverage remains the binding constraint: almost none carry a phone or email, so enrichment and assignment cannot compensate for having no way to reach the person, and 0 have been touched (`lead_touches`, `notification_log` both empty). |
 | `team_agents` | 1 | James Thompson, broker, linked to the only auth user. |
 | `lead_touches`, `deals`, `outreach`, `owners`, `notification_log`, `inrange_leads`, `contact_activities` | 0 | Never written. |
 | `rental_*`, `landlord_leads`, `tours`, `content_queue`, `automation_settings` | 0 | Leasing module and blog automation tables, unused. |
