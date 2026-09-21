@@ -66,6 +66,21 @@ this session.
 > leads. Reset them and re-ran for real: **23/23 sent**, verified against 23
 > individual Make executions, not just the caller's success count. See
 > revised 4.5. Not a repo change — Make/Supabase configuration only.
+>
+> **`ingest-leads` fixed, ~23:20 UTC.** The `.or()` bug from §4.4 that broke
+> on any comma-containing name is fixed and deployed (v38): PostgREST's
+> comma-as-separator problem solved by quoting the value, `eq()` switched to
+> `ilike()` to match the unique index's case-insensitive normalization.
+> Verified against the exact lead that failed earlier in this session
+> (`420 West 42nd Street, Llc`) — now updates in place instead of erroring;
+> `isa_leads` stayed at 162 rows. Unlike the Route A and notification work,
+> **this is a real code change**: source added to the repo at
+> `supabase/functions/ingest-leads/index.ts`, which didn't exist there
+> before (see the drift finding, §2.1/2.2). One gap left open on purpose:
+> the lookup still doesn't match on address, so two same-named leads at
+> different addresses in the same segment/market would still collide —
+> bounded by the existing per-lead error handling, not silent corruption.
+> See revised 4.4.
 
 ---
 
@@ -84,7 +99,7 @@ the lead's actual assigned agent.
 | Stage | Status | Evidence |
 |---|---|---|
 | Property ingestion (NYC HPD, evictions, NJ MOD-IV) | Working, scheduled daily 07:00–08:30 ET | 900 raw rows as of 22:46 UTC (was 879). S1b/S1c/S1d moved to a daily schedule and re-verified live today; see §7 and the PR notes on the Route A ops work. |
-| ISA lead ingestion (ACRIS divorce, empty-nester, developer) | Working; duplicates cleaned and now blocked at the DB | Table deduplicated 627 → 162 rows, 465 removed to a backup table, partial unique index applied and guard-tested. The `.or()` filter in `ingest-leads` is still unfixed — the index is what holds the line. See 4.4. |
+| ISA lead ingestion (ACRIS divorce, empty-nester, developer) | **Working — dedup fixed at both the app and DB layer** | Table deduplicated 627 → 162 rows, partial unique index applied and guard-tested. The `.or()` filter that broke on comma-containing names is now also fixed and deployed (v38) — re-verified against the exact lead that failed earlier; it updates in place instead of erroring. Source now tracked in-repo. See 4.4. |
 | AI enrichment, Anthropic path (`enrich-leads`, `enrich-pending`) | **Working** (as of 2026-09-21 ~19:20 UTC) | Live call returned `enriched: 1`, 358 input / 596 output tokens, and wrote `ai_summary`, BANT and routing to a real lead. The 401 was a bad key string, fixed on the third replacement. See 4.1. |
 | AI enrichment, Gemini path (S2 via `list-pending-enrichment` → `write-enrichment`) | **Blocked on billing, status unchanged** | All 50 `write-enrichment` calls in the 16:14–16:22 run returned **422**, caused by an empty Gemini prepay balance the `Resume` handler masked. Top-up pending as of 18:40 UTC, not re-checked since. The response mapping remains unproven. See 4.2. |
 | Lead assignment (`assign-leads`) | **Working — 100% of current leads assigned** | Re-checked live: all 162 leads carry `assigned_agent_id`, all to the sole agent. A wildcard rule (`segment: null`, priority 99) added to `agent_routing_rules` since the original finding catches everything the 11 named rules don't. See revised 4.5 — the original "no rule, 432 unassigned" claim is corrected there, not deleted. |
@@ -480,11 +495,31 @@ the key started working. **Verified from the backup.**
 
 #### Still open
 
-- **The `.or()` filter in `ingest-leads` is unchanged.** The index now
-  converts the bug from silent duplication into a visible insert error, which
-  is the right failure mode but is still a failure mode. The fix is two
-  `.eq()` queries, or a `.or()` with the values wrapped in double quotes, or
-  better, an upsert on the natural key so a re-run is idempotent by design.
+- **RESOLVED, 2026-09-21 ~23:20 UTC.** The `.or()` filter that broke on any
+  comma-containing name is fixed. PostgREST reads a bare comma inside an
+  `.or()`/`.and()` value as the clause separator; the fix wraps each value
+  in double quotes, which is PostgREST's own escape for that. Switched
+  `.eq()` to `.ilike()` (with `%`/`_` escaped so the comparison stays
+  literal) in the same pass, since the unique index normalizes with
+  `lower(btrim(...))` and an exact-match lookup would miss two spellings of
+  the same name that the index — and a human — would treat as one lead.
+  Deployed as `ingest-leads` v38, source now tracked at
+  `supabase/functions/ingest-leads/index.ts` (previously untracked — see the
+  drift finding in §2.1/2.2). **Verified with the exact case that failed
+  earlier**, not a synthetic one: re-posted `420 West 42nd Street, Llc` (the
+  lead the unique index rejected during the S19 test in §7) — it now
+  updates the existing row (`upserted: 1`, same row id, `created_at`
+  unchanged, only `updated_at` moved), not a new one; `isa_leads` stayed at
+  162 rows. A second post in ALL CAPS matched the same row too, confirming
+  the case-insensitive part of the fix independently.
+
+  Known remaining gap, left open on purpose: the lookup still matches on
+  name alone, not name+address like the unique index does. Two different
+  people sharing a name in the same segment/market at different addresses
+  will collide — bounded by the existing per-lead try/catch (one skipped
+  lead with a clear error, not data corruption), but real. Needs its own
+  address-normalization decision before fixing, so it wasn't folded into
+  this pass.
 - **`source_document_id` is still not captured.** The ACRIS document ID is
   the actual identity of these records; name plus address is a good proxy and
   nothing more. Until it is stored, two genuinely distinct filings on the
