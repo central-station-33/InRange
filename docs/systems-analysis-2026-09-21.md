@@ -10,6 +10,16 @@ in live data, logs, or source. **Likely** means inferred from code reading
 with no live confirmation. **Unverified** means it could not be checked from
 this session.
 
+> **Revised 2026-09-21 ~17:40 UTC** after re-checking both enrichment paths.
+> The Gemini path changed under us between 16:11 and 16:14: the model was
+> moved to `gemini-3.6-flash`, `thinkingConfig` was dropped, and the error
+> handler was swapped from `Ignore` to `Resume`. The scenario now completes
+> without a Gemini API error, and **still writes nothing** — all 50
+> `write-enrichment` calls in the 16:14–16:22 run returned 422. The Anthropic
+> path is unchanged (`401`). That re-check also surfaced a new structural bug
+> in S2, section 4.6. Superseded numbers are marked as such rather than
+> deleted.
+
 ---
 
 ## 1. Bottom line
@@ -20,8 +30,8 @@ The pipeline ingests, but nothing downstream of ingestion works today.
 |---|---|---|
 | Property ingestion (NYC HPD, evictions, NJ MOD-IV) | Working, last run 2026-09-14 | 879 raw rows, 915 properties, 0 unprocessed |
 | ISA lead ingestion (ACRIS divorce, empty-nester, developer) | Working, but producing duplicates | 534 leads created today, only 149 distinct addresses across the table |
-| AI enrichment, Anthropic path (`enrich-leads`, `enrich-pending`) | **Broken** | Every call returns `Anthropic 401` (50 of 50 leads on the 16:17 UTC run). Key is set (108 chars) but rejected. On 2026-09-15 the error was "credit balance too low". |
-| AI enrichment, Gemini path (S2 via `list-pending-enrichment` → `write-enrichment`) | **Broken** | Make runs today: `[402] prepayment credits depleted` at 14:54, `[404] gemini-2.5-flash no longer available` at 15:56, then repeated `[503]`. Zero leads carry a Gemini model tag. |
+| AI enrichment, Anthropic path (`enrich-leads`, `enrich-pending`) | **Broken** | Every call returns `Anthropic 401`, 50 of 50 leads, most recently the 16:22:55 UTC run. Key is set (108 chars) but rejected. On 2026-09-15 the error was "credit balance too low". |
+| AI enrichment, Gemini path (S2 via `list-pending-enrichment` → `write-enrichment`) | **Broken, new failure mode** | The Gemini API errors are gone as of the 16:14 edit, but all 50 `write-enrichment` calls in the 16:14–16:22 run returned **422** ("No JSON object in model response"). Zero leads carry a Gemini model tag. |
 | Lead assignment (`assign-leads`) | Working for 5 of 8 active segments | 195 leads assigned, all to the one agent. `divorce`, `empty_nester`, `homeowner`, `landlord` have no routing rule, so 432 leads sit unassigned. |
 | ISA notification (`notify-isa` → Make receiver) | Idle, not proven | Every run today ends `no_leads_matched` because no lead has both `ai_summary` and `outreach_status='new'`. The receiver scenario only logs a touch; it sends no SMS or email. |
 | Inbound lead fast response (S16 → `respond-lead`) | **Broken** | Last two real inbound events (2026-09-17) failed with `BundleValidationError` before reaching the edge function. |
@@ -179,20 +189,40 @@ repo; the README in PR #13 says the dashboard lives in a different repo).
 
 ## 4. API and enrichment errors (last 24 hours, plus history)
 
-### 4.1 Anthropic
+### 4.1 Anthropic — unchanged on re-check
 
 | When | Function | Error |
 |---|---|---|
 | 2026-09-15 00:19 | `enrich-pending` | `400 … Your credit balance is too low to access the Anthropic API` |
-| 2026-09-19 to now | `enrich-leads` | `Anthropic 401` on every lead, every run (9 runs today) |
+| 2026-09-19 to 2026-09-21 16:22:55 | `enrich-leads` | `Anthropic 401` on every lead, every run |
 
-The key is present (`anthropic_key_present: true`, 108 chars). A 401 with a
-key present means the key was revoked, regenerated, or belongs to an
-organization whose access ended. Refilling credits will not fix a 401.
-**Verified.** Fix: generate a new key, set it as the `ANTHROPIC_API_KEY`
-edge-function secret, re-run one `enrich-leads` call with `limit: 1`.
+The key is present (`anthropic_key_present: true`, 108 chars — the right
+length for a current key). A 401 with a key present means the key was
+revoked, regenerated, or belongs to an organization whose access ended.
+Refilling credits will not fix a 401, and the 2026-09-15 balance error is a
+separate, earlier problem. **Verified.**
 
-### 4.2 Gemini (Make module in S2)
+The model ID in `enrich-leads`, `claude-sonnet-4-6`, is a currently valid
+model. So the 401 is purely authentication: nothing about the request shape
+is at fault, and the function will start working on a valid key with no code
+change. **Verified.**
+
+One related item to check while the key is being replaced: `respond-lead`
+and `enrich-pending` both request `claude-haiku-4-5-20251001`, a
+date-suffixed form of the `claude-haiku-4-5` ID. Current guidance is to use
+the unsuffixed ID. Whether the suffixed form still resolves was not tested
+here, and it would surface as a 404 rather than a 401. **Unverified** —
+worth one probe once the key works, because `respond-lead` is the inbound
+auto-responder and a silent 404 there means inbound leads get the canned
+fallback SMS instead of a written reply.
+
+Fix: generate a new key, set it as the `ANTHROPIC_API_KEY` edge-function
+secret, re-run one `enrich-leads` call with `limit: 1`, and confirm
+`ai_model` and `ai_enriched_at` land on that row.
+
+### 4.2 Gemini (Make module in S2) — new failure mode on re-check
+
+Earlier errors, now resolved:
 
 | When | Error |
 |---|---|
@@ -200,17 +230,67 @@ edge-function secret, re-run one `enrich-leads` call with `limit: 1`.
 | 15:56 UTC | `[404] gemini-2.5-flash is no longer available to new users … use gemini-3.6-flash` |
 | 15:55 to 16:00 UTC | `[503] This model is currently experiencing high demand` (5 runs) |
 
-S2 was then edited 8 times between 14:48 and 16:01 and now "succeeds" with
-52 operations, but `write-enrichment` returned 422 on 8 of its last 10 calls
-and zero `isa_leads` rows carry an `ai_model` value. The success is the
-`Ignore` error handler on the Gemini module swallowing every failure.
-**Verified.** The S2 module still names `gemini-2.5-flash` in its blueprint.
+Between 16:11 and 16:14 the scenario was edited three more times. The
+current blueprint (last edited 16:14:46) differs from the version described
+earlier in this report:
+
+- `model` is now `gemini-3.6-flash`, which clears the 404.
+- `thinkingConfig` and `imageConfig` were removed from `generationConfig`;
+  only `responseMimeType: application/json` remains.
+- The Gemini module's error handler changed from `builtin:Ignore` to
+  `builtin:Resume`, substituting `{candidates: [], usageMetadata: {…: 0}}`.
+- The `write-enrichment` module got its own `Resume` handler substituting
+  `{data: {}, success: false}`.
+
+The 16:14:52 → 16:22:56 run then completed with status SUCCESS, 252
+operations, over 8 minutes. It is the first run that reached
+`write-enrichment` for every lead. The result:
+
+| Path | Status | Count |
+|---|---|---|
+| `write-enrichment` | **422** | **50 of 50** |
+| `enrich-leads` | 200 (all leads 401 internally) | 50 |
+| `notify-isa` | 200, `no_leads_matched` | 100 |
+
+**Verified** from edge logs and the Make execution record. A 422 from
+`write-enrichment` has exactly one cause in its source: `parseModelJson`
+found no `{` in `raw_text`. So the scenario is now handing that endpoint an
+empty or non-JSON string on every lead.
+
+Two candidate causes, and this session could not distinguish them:
+
+1. **Gemini is still failing and `Resume` is masking it.** The substituted
+   bundle sets `candidates: []`, so `{{3.candidates[1].content.parts[1].text}}`
+   resolves to empty, and `write-enrichment` 422s. The switch from `Ignore`
+   to `Resume` made this worse, not better: `Ignore` skipped the lead,
+   whereas `Resume` guarantees a doomed downstream call and burns two
+   operations doing it. The 402 credit-depletion error at 14:54 was never
+   shown to be resolved, and a still-empty prepay balance would produce
+   exactly this on all 50.
+2. **The response mapping is wrong.** `{{3.candidates[1].content.parts[1].text}}`
+   may not match what the Make Gemini module actually emits for this model.
+   An earlier version of this mapping was demonstrably wrong in a different
+   way: the `write-enrichment` diagnostic row from 14:53 shows `raw_text`
+   arriving as the **prompt** (`"Analyze this prospect and return JSON
+   only.…"`, 1,006 chars), meaning the field was mapped to `{{2.prompt}}`
+   at that point.
+
+Cause 1 is the more parsimonious fit for a uniform 50-of-50 failure, but
+calling it without evidence would be a guess. **Likely, not Verified.**
+
+The distinguishing diagnostic is one line: `write-enrichment` version 4
+persisted a `diag_write_enrichment_*` row recording `raw_text_length` and
+`raw_text_preview`; version 5 (deployed 14:56) dropped it. Restore that
+persist call, run S2 with `limit: 1`, and the row says immediately whether
+`raw_text` is empty (cause 1) or is populated with the wrong content
+(cause 2). Checking the Google AI Studio prepay balance answers cause 1
+directly and costs nothing.
 
 ### 4.3 Supabase edge functions
 
 | Path | Status | Count | Meaning |
 |---|---|---|---|
-| `write-enrichment` | 422 | 8 | "parse failed: No JSON object in model response" (Gemini returned nothing) |
+| `write-enrichment` | 422 | 50 (latest run) + 8 earlier | "parse failed: No JSON object in model response" |
 | `list-pending-enrichment` | 401 | 1 | Secret mismatch during the 14:19 edit |
 | `ingest-leads` | 401 | 1 | Same |
 | `ingest-acris-empty-nester` | 500 | 1 | Timed out at 100 s on the ACRIS 3-way join; the retry succeeded |
@@ -258,6 +338,51 @@ it, which is the actual ACRIS identity.
   no Slack. **Verified from blueprint.**
 
 ---
+
+### 4.6 Structural bug in S2: batch modules run inside the per-lead loop
+
+Found while re-checking the Gemini path. In the current S2 blueprint,
+module 2 is a `BasicFeeder` iterating `{{1.data.data.leads}}`. Everything
+after it runs **once per lead**. Modules 3 and 4 (Gemini, `write-enrichment`)
+belong there — they are per-lead by design. Modules 5, 6 and 7 do not:
+
+| Module | What it is | Should run | Actually runs |
+|---|---|---|---|
+| 5 | `enrich-leads` with `{"limit": 50}` | once per run | once per lead |
+| 6 | `notify-isa` `{"routing":"hot","limit":20}` | once per run | once per lead |
+| 7 | `notify-isa` `{"routing":"warm","limit":30}` | once per run | once per lead |
+
+**Verified** three ways: the blueprint has no aggregator between modules 4
+and 5; the 16:14 run recorded 252 Make operations where a correctly shaped
+50-lead run needs about 104; and the edge logs for that window show exactly
+50 `enrich-leads` and 100 `notify-isa` calls against 50 `write-enrichment`
+calls.
+
+Consequences, in order of how much they matter:
+
+- **Make operations.** About 148 wasted operations per run, roughly 2.4× the
+  necessary count. That scales linearly with batch size: a 200-lead batch
+  would waste ~600.
+- **Runtime.** The run took 8 minutes and 4 seconds, almost all of it in the
+  50 sequential `enrich-leads` calls. Each carries a 90-second Make timeout,
+  so a batch where Anthropic actually responds is a plausible timeout
+  candidate — and the 2026-09-08 run already failed exactly that way.
+- **Notification duplication risk.** `notify-isa` flips a lead to
+  `attempting` after a successful send, so a second pass will not re-send
+  the same lead. That is the only reason 100 invocations are not 100 duplicate
+  alerts. It is load-bearing behaviour nobody designed for.
+- **Anthropic spend is *not* multiplied 50×.** `enrich-leads` selects leads
+  with `ai_summary IS NULL` and a limit of 50, so successive calls walk
+  through the pending pool rather than re-enriching it. With 585 pending
+  leads and a working key, roughly the first 12 calls would do real work and
+  the remaining 38 would return zero rows. The cost is wasted round trips,
+  not a 50× token bill. Worth stating plainly because the operation count
+  looks alarming and the token exposure is the thing that would actually be
+  expensive.
+
+Fix: put an aggregator (or a second route off a router) between module 4 and
+module 5, so modules 5–7 run once after the loop finishes rather than inside
+it.
 
 ## 5. Data quality snapshot
 
@@ -330,28 +455,35 @@ repository. The Vercel account has projects named `cc-make-retool` and
 
 ## 7. Recommended order of work
 
-1. **Stop the bleeding on enrichment.** New Anthropic key; pick one Gemini
-   model that exists and is funded, or drop the Gemini path. Until one of
-   those is done, every downstream stage is idle.
-2. **Deduplicate `isa_leads` and fix the `.or()` filter** before running any
+1. **Get one enrichment path working, and only one.** The Anthropic fix is a
+   new key and nothing else — the model ID is valid and the code is sound, so
+   this is the shortest route to a working pipeline. The Gemini path needs a
+   diagnosed 422 on top of a funded balance and a verified response mapping.
+   Fix the key first, confirm one lead enriches end to end, then decide
+   whether Gemini is still wanted.
+2. **Before any more S2 runs: move modules 5–7 out of the iterator** (section
+   4.6). Right now every run makes 148 unnecessary Make operations and 100
+   `notify-isa` calls. That is tolerable while everything 401s and is not
+   tolerable once the key works.
+3. **Deduplicate `isa_leads` and fix the `.or()` filter** before running any
    more ACRIS bridges. Add the unique index so it cannot recur.
-3. **Add routing rules** for `divorce`, `empty_nester`, `homeowner`, `landlord`
+4. **Add routing rules** for `divorce`, `empty_nester`, `homeowner`, `landlord`
    or the ingested leads are invisible to agents.
-4. **Put a real delivery channel back in the Notify Receiver** (email at
+5. **Put a real delivery channel back in the Notify Receiver** (email at
    minimum) and fix S16's validation error, or inbound leads are lost.
-5. **Add the `x-make-secret` check to `ingest-raw-properties`**, rotate the
+6. **Add the `x-make-secret` check to `ingest-raw-properties`**, rotate the
    shared secret, and move it to a Make environment variable.
-6. **Schedule S10 and the ingest scenarios** so the system runs without a
+7. **Schedule S10 and the ingest scenarios** so the system runs without a
    person clicking Run.
-7. **Merge PR #13, then re-sync** the 7 missing functions and 3 migrations,
+8. **Merge PR #13, then re-sync** the 7 missing functions and 3 migrations,
    and close the 10 PRs that no longer reflect the system.
-8. **Decide where the dashboard lives.** Either build `nextjs-inrange` out
+9. **Decide where the dashboard lives.** Either build `nextjs-inrange` out
    using the existing role-based RLS with the anon key (not the service-role
    key), or move PR #4's `dashboard/` there and rewrite its data layer.
-9. **Consent gate before any outbound SMS.** Require `sms_consent=true` in
-   `follow-up-cadence`, and treat inbound-SMS replies as the only implied
-   consent.
-10. Clean-up: delete the 21 orphaned webhooks, the 4 `ZZ Temp` scenarios,
+10. **Consent gate before any outbound SMS.** Require `sms_consent=true` in
+    `follow-up-cadence`, and treat inbound-SMS replies as the only implied
+    consent.
+11. Clean-up: delete the 21 orphaned webhooks, the 4 `ZZ Temp` scenarios,
     the 4 retired 410 functions, and either fix or disable Scenario 1.
 
 ---
