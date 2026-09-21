@@ -25,18 +25,29 @@ this session.
 > prepay top-up has not landed yet and is expected to take a few hours.
 > That confirms the cause of the 422s in section 4.2 and creates a specific
 > risk when the credits do arrive — see the trap described there.
+>
+> **Resolved since, ~19:45 UTC.** Two findings in this report are now fixed
+> and are marked RESOLVED in place rather than deleted, so the evidence trail
+> survives. (a) The Anthropic 401 is gone — a third key replacement took, and
+> a live call through `enrich-leads` enriched a real lead and wrote a real row
+> (section 4.1). (b) `isa_leads` has been deduplicated, 627 rows down to 162,
+> and a partial unique index now makes the duplicate class impossible
+> (section 4.4). Fixing the key also exposed a new, separate defect in the
+> routing the ISA acts on — section 4.7, which is open.
 
 ---
 
 ## 1. Bottom line
 
-The pipeline ingests, but nothing downstream of ingestion works today.
+The pipeline ingests, and as of ~19:20 UTC on 2026-09-21 the Anthropic
+enrichment path works. Everything downstream of enrichment — routing,
+assignment, notification, delivery — still does not.
 
 | Stage | Status | Evidence |
 |---|---|---|
 | Property ingestion (NYC HPD, evictions, NJ MOD-IV) | Working, last run 2026-09-14 | 879 raw rows, 915 properties, 0 unprocessed |
-| ISA lead ingestion (ACRIS divorce, empty-nester, developer) | Working, but producing duplicates | 534 leads created today, only 149 distinct addresses across the table |
-| AI enrichment, Anthropic path (`enrich-leads`, `enrich-pending`) | **Broken** | `401 authentication_error — "API key is invalid."` A replacement key installed 18:30 UTC did not fix it; a stale worker was ruled out by testing a cold isolate. See 4.1. |
+| ISA lead ingestion (ACRIS divorce, empty-nester, developer) | Working; duplicates cleaned and now blocked at the DB | Table deduplicated 627 → 162 rows, 465 removed to a backup table, partial unique index applied and guard-tested. The `.or()` filter in `ingest-leads` is still unfixed — the index is what holds the line. See 4.4. |
+| AI enrichment, Anthropic path (`enrich-leads`, `enrich-pending`) | **Working** (as of 2026-09-21 ~19:20 UTC) | Live call returned `enriched: 1`, 358 input / 596 output tokens, and wrote `ai_summary`, BANT and routing to a real lead. The 401 was a bad key string, fixed on the third replacement. See 4.1. |
 | AI enrichment, Gemini path (S2 via `list-pending-enrichment` → `write-enrichment`) | **Blocked on billing** | All 50 `write-enrichment` calls in the 16:14–16:22 run returned **422**, caused by an empty Gemini prepay balance the `Resume` handler masked. Top-up pending as of 18:40 UTC. The response mapping remains unproven. See 4.2. |
 | Lead assignment (`assign-leads`) | Working for 5 of 8 active segments | 195 leads assigned, all to the one agent. `divorce`, `empty_nester`, `homeowner`, `landlord` have no routing rule, so 432 leads sit unassigned. |
 | ISA notification (`notify-isa` → Make receiver) | Idle, not proven | Every run today ends `no_leads_matched` because no lead has both `ai_summary` and `outreach_status='new'`. The receiver scenario only logs a touch; it sends no SMS or email. |
@@ -44,6 +55,7 @@ The pipeline ingests, but nothing downstream of ingestion works today.
 | Inbound SMS (S18) and email parser (S17) | Never executed | Both active since 2026-09-06 with zero runs. |
 | Follow-up cadence (`follow-up-cadence`) | Not scheduled | The only scenario that calls it (ISA S19) is inactive and marked invalid. |
 | Skip trace (DataSkip) | Wired, spend gated | 2 confirmations issued, 2 leads matched, 18 no-match. Two-step approval gate works as designed. |
+| AI routing (`bant_score` → `routing`) | **Broken, and it was broken before the key was fixed** | 21 of 172 enriched rows carry a `routing` that contradicts the prompt's own stated rules, including identical rows that got both `cold` and `nurture`. `enrich-leads` trusts the model's `routing` string instead of deriving it. See 4.7. |
 | Dashboard / login | **Does not exist in production** | See section 6. |
 
 Confidence: Verified for every row except cadence scheduling (Likely; the
@@ -195,69 +207,70 @@ repo; the README in PR #13 says the dashboard lives in a different repo).
 
 ## 4. API and enrichment errors (last 24 hours, plus history)
 
-### 4.1 Anthropic — unchanged on re-check
+### 4.1 Anthropic — RESOLVED 2026-09-21 ~19:20 UTC
 
-| When | Function | Error |
-|---|---|---|
-| 2026-09-15 00:19 | `enrich-pending` | `400 … Your credit balance is too low to access the Anthropic API` |
-| 2026-09-19 to 2026-09-21 16:22:55 | `enrich-leads` | `Anthropic 401` on every lead, every run |
+**Current state: working.** A live call through `enrich-leads` returned
+`enriched: 1` with 358 input and 596 output tokens and wrote `ai_summary`,
+the four BANT components and `routing` to a real lead row. That is the test
+that matters — not the absence of an error in a log, but a paid call whose
+output landed in the table. **Verified.**
 
-The key is present (`anthropic_key_present: true`, 108 chars — the right
-length for a current key). A 401 with a key present means the key was
-revoked, regenerated, or belongs to an organization whose access ended.
-Refilling credits will not fix a 401, and the 2026-09-15 balance error is a
-separate, earlier problem. **Verified.**
-
-The model ID in `enrich-leads`, `claude-sonnet-4-6`, is a currently valid
-model. So the 401 is purely authentication: nothing about the request shape
-is at fault, and the function will start working on a valid key with no code
-change. **Verified.**
-
-One related item to check while the key is being replaced: `respond-lead`
-and `enrich-pending` both request `claude-haiku-4-5-20251001`, a
-date-suffixed form of the `claude-haiku-4-5` ID. Current guidance is to use
-the unsuffixed ID. Whether the suffixed form still resolves was not tested
-here, and it would surface as a 404 rather than a 401. **Unverified** —
-worth one probe once the key works, because `respond-lead` is the inbound
-auto-responder and a silent 404 there means inbound leads get the canned
-fallback SMS instead of a written reply.
-
-**Update, 2026-09-21 18:30 UTC — a new key was installed and did not fix
-it.** Tested directly through two functions. Anthropic's verbatim response:
+It took three key replacements. The two that failed both returned:
 
 ```
 401 {"type":"error","error":{"type":"authentication_error",
      "message":"API key is invalid."},"request_id":null}
 ```
 
-That is more specific than the earlier reading. It is not an expiry, not a
-balance problem (which returns a 400 with a distinct message, as on
-2026-09-15), and not workspace scoping (a 400 naming
-`anthropic-workspace-id`). The key string reaching Anthropic is being
-rejected outright, and `request_id: null` means it was discarded before
-becoming a request.
+The diagnostic trail is kept below because the same failure will recur the
+next time a key is rotated, and the cheap checks are worth having written
+down.
 
-A stale warm worker was ruled out rather than assumed. `enrich-leads`
-captures the key once at module load, so it could serve an old value
-indefinitely; `enrich-pending` reads it inside the handler and had been
-cold since 2026-09-15, so it booted fresh against the currently stored
-secret. Both returned the same error. **A redeploy will not help.**
+| When | Function | Error |
+|---|---|---|
+| 2026-09-15 00:19 | `enrich-pending` | `400 … Your credit balance is too low to access the Anthropic API` |
+| 2026-09-19 to 2026-09-21 16:22:55 | `enrich-leads` | `Anthropic 401` on every lead, every run |
+| 2026-09-21 18:30 | both | `401 … "API key is invalid."` after first replacement |
+| 2026-09-21 ~19:20 | `enrich-leads` | none — `enriched: 1` |
 
-What is still open: whether the stored secret ever changed. The function
-reports the key length as 108 characters, identical to the previous key —
-which is also the normal length for a valid key, so it discriminates
-nothing. Two checks settle it:
+What the 401 was and was not:
 
-1. `supabase secrets list --project-ref omzugrtgwsjypekuzgtn` prints a
-   digest per secret. An unchanged digest means the save never landed
-   (wrong project — `silent-legacy-media` is also active in that org — or
-   an uncommitted dashboard edit).
-2. Test the key against Anthropic directly from a workstation, which
-   separates "is the key good" from "did Supabase receive it".
+- **Not an expiry and not a balance problem.** A depleted balance returns a
+  400 with a distinct message, as on 2026-09-15.
+- **Not workspace scoping.** An unscoped (organization-level) key returns a
+  400 naming `anthropic-workspace-id`, not a 401 — none of these functions
+  send that header, so a workspace-scoped key is the right choice here.
+- **Not a stale warm isolate**, and this was ruled out rather than assumed.
+  `enrich-leads` captures the key once at module load and can serve an old
+  value indefinitely; `enrich-pending` reads it inside the handler and had
+  been cold since 2026-09-15, so it booted fresh against the stored secret.
+  Both returned the same error, so a redeploy would not have helped.
+- **`request_id: null`** means the string was rejected before it became a
+  request. The key text reaching Anthropic was simply wrong.
 
-Also worth ruling out: a key beginning `sk-ant-admin` is an Admin key and
-is rejected by the Messages API by design. A valid inference key begins
-`sk-ant-api`.
+The one discriminator that does not work: key length. All three keys reported
+108 characters, so `anthropic_key_len` in the diagnostic row tells you nothing
+about whether a save landed. Use `supabase secrets list --project-ref
+omzugrtgwsjypekuzgtn`, which prints a per-secret digest, or test the key
+against Anthropic directly from a workstation.
+
+Rotation checklist, for next time:
+
+1. The key must begin `sk-ant-api`. `sk-ant-admin` is an Admin key and is
+   rejected by the Messages API by design; `sk-ant-oat01-` is an OAuth token
+   and is not a Messages API credential either.
+2. Scope it to the **workspace**, not the organization, unless you also add
+   an `anthropic-workspace-id` header to every function.
+3. Save it to project `omzugrtgwsjypekuzgtn` (InRange). `silent-legacy-media`
+   is also active in the same org and is the easy mis-save.
+4. Verify with a real call that writes a row, not with a log that is quiet.
+
+**Still open from this section.** `respond-lead` and `enrich-pending` both
+request `claude-haiku-4-5-20251001`, a date-suffixed form. Whether it still
+resolves was not tested, and it would surface as a 404, not a 401 — so a
+working key does not clear it. Worth one probe, because `respond-lead` is the
+inbound auto-responder and a silent 404 there means inbound leads get the
+canned fallback SMS instead of a written reply. **Unverified.**
 
 ### 4.2 Gemini (Make module in S2) — new failure mode on re-check
 
@@ -359,7 +372,12 @@ No 4xx or 5xx on any other function in the window. Edge logs show 520
 requests with status 400 on an empty path; these are API-gateway rejections,
 most likely PostgREST calls with malformed filters (see 4.4). **Likely.**
 
-### 4.4 Data-integrity bug: lead deduplication is broken
+### 4.4 Lead deduplication — data RESOLVED 2026-09-21 ~19:30 UTC, code still open
+
+**The duplicates are gone and cannot come back. The bug that created them is
+still in the source.** Those are two different statements and both matter.
+
+#### The bug
 
 `ingest-leads` deduplicates with a PostgREST filter:
 
@@ -367,21 +385,76 @@ most likely PostgREST calls with malformed filters (see 4.4). **Likely.**
 .or(`full_name.eq.${identifier},entity_name.eq.${identifier}`)
 ```
 
-PostgREST uses the comma as the OR separator. 552 of 627 leads have a name
-containing a comma (ACRIS returns `LAST, FIRST`), so the filter is parsed as
-three clauses, the third malformed, and the lookup fails or returns
-nothing. The insert then proceeds. Each ACRIS bridge run (S8 and S9 were run
-3 and 4 times today) re-inserted the same leads. Result: 68 addresses appear
-2 to 9 times, and the "534 new leads today" figure is closer to 70 unique
-people. **Verified** (names with comma: 552; distinct addresses: 149).
+PostgREST uses the comma as the OR separator. 552 of 627 leads had a name
+containing a comma (ACRIS returns `LAST, FIRST`), so the filter parsed as
+three clauses, the third malformed, and the lookup returned nothing. The
+insert then proceeded. Each ACRIS bridge run (S8 and S9 ran 3 and 4 times on
+2026-09-21) re-inserted the same leads. Result: 68 addresses appeared 2 to 9
+times, and the "534 new leads today" figure was closer to 70 unique people.
+**Verified** (names with comma: 552; distinct addresses: 149).
 
 Secondary cause: `maybeSingle()` throws when more than one row matches, which
-is now guaranteed, so even a fixed filter would fail until the table is
-deduplicated. Fix in this order: (1) delete duplicates keeping the earliest
-row per `(segment, market, lower(property_address))`; (2) add a unique index
-on that key; (3) change the lookup to two `.eq()` queries or a `.or()` with
-values wrapped in double quotes; (4) add `source_document_id` and dedupe on
-it, which is the actual ACRIS identity.
+was guaranteed once duplicates existed, so even a corrected filter would have
+kept failing until the table was cleaned.
+
+#### What was done
+
+1. **Backed up first.** All 465 rows destined for deletion were copied to
+   `isa_leads_dedupe_backup_20260921` before anything was removed. Still
+   present, 465 rows, confirmed by count. Nothing was destroyed.
+2. **Deduplicated**, keeping the earliest row per natural key. 627 → 162
+   rows, 465 deleted, 0 duplicate groups remaining. **Verified by re-query.**
+3. **Applied a partial unique index**, committed to the repo as
+   `supabase/migrations/20260921193000_isa_leads_natural_key_unique_index.sql`:
+
+   ```sql
+   create unique index if not exists isa_leads_natural_key_uidx
+   on isa_leads (
+     coalesce(segment, ''),
+     coalesce(market, ''),
+     lower(btrim(coalesce(full_name, entity_name, ''))),
+     lower(btrim(coalesce(property_address, '')))
+   )
+   where outreach_status is distinct from 'dead'
+     and outreach_status is distinct from 'closed';
+   ```
+
+   `coalesce` on every term is load-bearing: a NULL in any column would
+   otherwise make the row unique against everything, which is exactly the
+   escape hatch the ACRIS rows would have used. `is distinct from` rather
+   than `not in` for the same reason — `outreach_status NULL NOT IN (...)`
+   evaluates to NULL, not true, and the row would fall out of the index.
+   The partial predicate is deliberate: a dead or closed lead should not
+   block re-ingesting the same person later.
+4. **Guard-tested with a real rejected insert**, not by reading the DDL. A
+   deliberate duplicate was attempted and Postgres refused it.
+
+#### What it cost
+
+Measured from the backup table, the duplicates were not merely untidy — they
+were billed. 97 of the 465 deleted rows carried an `ai_summary`, and **10 of
+them carried audited token counts** — 10 paid Anthropic calls and 6,136
+output tokens spent analysing people the table already held. (The other 87
+pre-date the `ai_input_tokens`/`ai_output_tokens` audit columns, so their cost
+is unknown, not zero.) At Sonnet rates the measurable waste is small money,
+but it scaled linearly with bridge runs and would have compounded the moment
+the key started working. **Verified from the backup.**
+
+#### Still open
+
+- **The `.or()` filter in `ingest-leads` is unchanged.** The index now
+  converts the bug from silent duplication into a visible insert error, which
+  is the right failure mode but is still a failure mode. The fix is two
+  `.eq()` queries, or a `.or()` with the values wrapped in double quotes, or
+  better, an upsert on the natural key so a re-run is idempotent by design.
+- **`source_document_id` is still not captured.** The ACRIS document ID is
+  the actual identity of these records; name plus address is a good proxy and
+  nothing more. Until it is stored, two genuinely distinct filings on the
+  same property by the same owner cannot be told apart.
+- `isa_leads_dedupe_backup_20260921` is working data sitting in `public`.
+  The `ensure_rls` event trigger should have enabled RLS on it automatically,
+  but that was not confirmed, and no policy was written for it either way.
+  Drop it once the cleanup is accepted, or move it out of `public`.
 
 ### 4.5 Assignment and notification
 
@@ -443,20 +516,94 @@ Fix: put an aggregator (or a second route off a router) between module 4 and
 module 5, so modules 5–7 run once after the loop finishes rather than inside
 it.
 
+### 4.7 NEW: routing is taken from the model, not derived from the score
+
+This was invisible while everything 401'd. Fixing the Anthropic key made it
+visible, and it affects the one field an ISA acts on directly.
+
+`enrich-leads` computes `bantScore` itself, correctly, by summing the four
+clamped components — and then ignores it when setting `routing`:
+
+```ts
+const routing = typeof result.routing === 'string' && ROUTINGS.has(result.routing)
+  ? result.routing
+  : null;
+```
+
+Any of the four strings in `ROUTINGS` is accepted on the model's word alone.
+The system prompt states the rules the model is supposed to apply:
+
+```
+- hot:     bant total >= 9 AND motivation_score >= 4
+- warm:    bant total >= 7 OR  motivation_score >= 3
+- nurture: bant total >= 4
+- cold:    all other cases
+```
+
+Those rules are arithmetic. The code already has both inputs in hand at the
+moment it writes the row. It asks the model instead.
+
+**The model does not follow them.** Applying the prompt's own rules to every
+enriched row (75 live plus 97 in the dedupe backup, 172 total) gives **151
+agreements and 21 violations — 12% of assessments routed against the stated
+policy.** **Verified.**
+
+| `bant_score` | routings actually written |
+|---|---|
+| 2 | `cold` ×12, `nurture` ×2 |
+| 3 | `cold` ×1, `nurture` ×3 |
+| 6 | `nurture` ×11, `warm` ×2 |
+| 7 | `nurture` ×6, `warm` ×10 |
+
+Score 7 is the clearest case: the rule says `warm`, and 6 of 16 rows at that
+score were written `nurture`. Score 2 and 3 straddle the `nurture` cutoff of
+4 in both directions. The strongest single piece of evidence is that
+**identical input produced different output**: five duplicate rows for
+`420 West 42nd Street, LLC` at the same address, all scored `bant_score 2`,
+were split across `cold` and `nurture`. Same prospect, same prompt, same
+score, two different call-list priorities — which is what non-determinism in
+a business rule looks like from the outside.
+
+Why it matters more than the percentage suggests: `routing` is what tells an
+ISA whether to call someone today. A lead demoted from `warm` to `nurture` is
+not called. `notify-isa` has separate hot and warm paths keyed on this field
+(the two calls inside the S2 iterator, section 4.6), so a wrong routing value
+does not just mis-sort a list, it changes whether a notification fires at all.
+
+Fix: derive it. Delete the model's `routing` from the write and compute it
+from `bantScore` and the clamped `motivation_score` using the four rules
+above. Keep `routing` in the requested JSON shape if you want the model's
+opinion recorded, but write it to a separate advisory column rather than the
+one the pipeline reads. This is a ~6-line change in `enrich-leads` and it
+makes the field reproducible from data already stored on every row.
+
+Two related notes on the same write path:
+
+- The `...(routing ? { routing } : {})` spread means a malformed `routing`
+  leaves the column at whatever it was before, silently. On a re-enrichment
+  that is a stale value presented as fresh. Deriving it removes the branch.
+- `bant_score` itself is sound — the component-sum fallback is well built and
+  the CHECK-constraint clamping before the write is the right instinct. The
+  defect is narrow and local to `routing`.
+
+**Not yet fixed.** Unlike 4.1 and 4.4, no change has been made for this.
+
 ## 5. Data quality snapshot
 
 | Table | Rows | Notes |
 |---|---|---|
 | `properties` | 915 | 49 Tier 1 pending enrichment since 2026-09-08; 0 complete; 3 quarantined. 592 of 915 have no ARV. |
 | `raw_properties` | 879 | All processed. 12 rows are diagnostics. |
-| `isa_leads` | 627 | 149 distinct addresses. 2 have phone or email. 42 have an `ai_summary` (all pre-dating the audit columns). 585 have `routing='new'`. |
+| `isa_leads` | 162 (was 627) | Deduplicated 2026-09-21; 465 rows moved to `isa_leads_dedupe_backup_20260921`. 75 have an `ai_summary`. Contact coverage remains the binding constraint: almost none carry a phone or email, so enrichment quality cannot compensate for having no way to reach the person. |
 | `team_agents` | 1 | James Thompson, broker, linked to the only auth user. |
 | `lead_touches`, `deals`, `outreach`, `owners`, `notification_log`, `inrange_leads`, `contact_activities` | 0 | Never written. |
 | `rental_*`, `landlord_leads`, `tours`, `content_queue`, `automation_settings` | 0 | Leasing module and blog automation tables, unused. |
 
-54 of today's leads have entity-shaped names (LLC, bank as trustee,
-condominium) in segments meant for individuals. The `homeowner` skip-trace
-path filters these; `divorce` and `empty_nester` do not.
+54 of the pre-dedupe leads had entity-shaped names (LLC, bank as trustee,
+condominium) in segments meant for individuals — the proportion after the
+dedupe was not re-measured. The `homeowner` skip-trace path filters these;
+`divorce` and `empty_nester` do not, and neither does the `enrich-leads`
+selection query, so the pipeline pays to analyse them (section 7, item 5).
 
 ---
 
@@ -514,36 +661,64 @@ repository. The Vercel account has projects named `cc-make-retool` and
 
 ## 7. Recommended order of work
 
-1. **Get one enrichment path working, and only one.** The Anthropic fix is a
-   new key and nothing else — the model ID is valid and the code is sound, so
-   this is the shortest route to a working pipeline. The Gemini path needs a
-   diagnosed 422 on top of a funded balance and a verified response mapping.
-   Fix the key first, confirm one lead enriches end to end, then decide
-   whether Gemini is still wanted.
-2. **Before any more S2 runs: move modules 5–7 out of the iterator** (section
-   4.6). Right now every run makes 148 unnecessary Make operations and 100
-   `notify-isa` calls. That is tolerable while everything 401s and is not
-   tolerable once the key works.
-3. **Deduplicate `isa_leads` and fix the `.or()` filter** before running any
-   more ACRIS bridges. Add the unique index so it cannot recur.
-4. **Add routing rules** for `divorce`, `empty_nester`, `homeowner`, `landlord`
-   or the ingested leads are invisible to agents.
-5. **Put a real delivery channel back in the Notify Receiver** (email at
+**Done since this report was written** (struck from the list, kept here so the
+ordering still reads as a sequence):
+
+- ~~Get the Anthropic path working.~~ Done — section 4.1. A real lead
+  enriched end to end at ~19:20 UTC.
+- ~~Deduplicate `isa_leads` and stop it recurring.~~ Data done and the unique
+  index is applied — section 4.4. **The `.or()` filter itself is still
+  unfixed**, so this is carried forward as item 2 below rather than closed.
+
+Remaining, in order:
+
+1. **Fix `routing` in `enrich-leads`** (section 4.7). Derive it from
+   `bant_score` and `motivation_score` instead of trusting the model's
+   string. This is first because the key now works, so every enrichment run
+   from here on writes more rows with a field that is wrong 12% of the time,
+   and `notify-isa` branches on it. Six lines. Then re-derive `routing` for
+   the 162 existing rows from the components already stored — no re-billing
+   needed.
+2. **Fix the `.or()` filter in `ingest-leads`** before the next ACRIS bridge
+   run (section 4.4). The unique index now catches the duplicates, so the
+   failure is loud instead of silent — but the next run will error rather
+   than insert. Convert the lookup to an upsert on the natural key and the
+   whole class goes away.
+3. **Before any more S2 runs: move modules 5–7 out of the iterator** (section
+   4.6). Every run makes 148 unnecessary Make operations and 100 `notify-isa`
+   calls. That was tolerable while everything 401'd. It is not tolerable now
+   that the key works, and it is a spend problem the moment Gemini credits
+   land too.
+4. **Decide whether Gemini is still wanted** (section 4.2). The credits are
+   pending. The response mapping in module 4 has never been observed
+   producing a value, so a funded balance proves nothing by itself — restore
+   the `write-enrichment` diagnostic row before the credits arrive, or the
+   first funded run will look like it worked and write nothing. With
+   Anthropic working and budget-gated at $15/month, running both paths is a
+   choice, not a necessity.
+5. **Stop paying to analyse entities in the `homeowner` segment.** The
+   enrichment prompt itself tells the model to flag "entity owner — no
+   individual to call"; the selection query does not filter them out, so the
+   pipeline pays Sonnet rates to be told a lead is uncallable.
+6. **Add routing rules** for `divorce`, `empty_nester`, `homeowner`,
+   `landlord`, or the ingested leads stay invisible to agents (section 4.5).
+7. **Put a real delivery channel back in the Notify Receiver** (email at
    minimum) and fix S16's validation error, or inbound leads are lost.
-6. **Add the `x-make-secret` check to `ingest-raw-properties`**, rotate the
+8. **Add the `x-make-secret` check to `ingest-raw-properties`**, rotate the
    shared secret, and move it to a Make environment variable.
-7. **Schedule S10 and the ingest scenarios** so the system runs without a
+9. **Schedule S10 and the ingest scenarios** so the system runs without a
    person clicking Run.
-8. **Merge PR #13, then re-sync** the 7 missing functions and 3 migrations,
-   and close the 10 PRs that no longer reflect the system.
-9. **Decide where the dashboard lives.** Either build `nextjs-inrange` out
-   using the existing role-based RLS with the anon key (not the service-role
-   key), or move PR #4's `dashboard/` there and rewrite its data layer.
-10. **Consent gate before any outbound SMS.** Require `sms_consent=true` in
+10. **Merge PR #13, then re-sync** the 7 missing functions and 3 migrations,
+    and close the 10 PRs that no longer reflect the system.
+11. **Decide where the dashboard lives.** Either build `nextjs-inrange` out
+    using the existing role-based RLS with the anon key (not the service-role
+    key), or move PR #4's `dashboard/` there and rewrite its data layer.
+12. **Consent gate before any outbound SMS.** Require `sms_consent=true` in
     `follow-up-cadence`, and treat inbound-SMS replies as the only implied
     consent.
-11. Clean-up: delete the 21 orphaned webhooks, the 4 `ZZ Temp` scenarios,
-    the 4 retired 410 functions, and either fix or disable Scenario 1.
+13. Clean-up: delete the 21 orphaned webhooks, the 4 `ZZ Temp` scenarios,
+    the 4 retired 410 functions, the `isa_leads_dedupe_backup_20260921`
+    table once the cleanup is accepted, and either fix or disable Scenario 1.
 
 ---
 
@@ -590,3 +765,7 @@ residential_sale_pipeline, segment_roi, unclaimed_leads.
 - DataSkip account balance.
 - Whether any Make environment variables (`MAKE_WEBHOOK_SECRET`,
   `SUPABASE_ANON_KEY`) are actually defined at the organization level.
+- Two post-dedupe re-measurements: the entity-shaped-name proportion in the
+  remaining 162 rows, and whether RLS is enabled on
+  `isa_leads_dedupe_backup_20260921`. Both are noted inline where they
+  matter (sections 4.4 and 5) rather than stated as fact.
