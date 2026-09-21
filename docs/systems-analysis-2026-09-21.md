@@ -81,6 +81,24 @@ this session.
 > different addresses in the same segment/market would still collide —
 > bounded by the existing per-lead error handling, not silent corruption.
 > See revised 4.4.
+>
+> **Routing derivation fixed, ~23:35 UTC.** `enrich-leads` now derives
+> `routing` from `bant_score`/`motivation_score` in code (v41) instead of
+> trusting the model's own string. Backfilled the 19 already-wrong live rows
+> at no additional cost — 162/162 now agree with the stated rules, 0
+> violations. Two of the 19 were `hot`→`warm` demotions already reflected in
+> real notification emails sent earlier this session; disclosed, not hidden.
+> See revised 4.7.
+>
+> **Also found while fixing this: a second AI agent (Perplexity Computer)
+> has direct deploy access to this same Supabase project and Make team**,
+> coordinating through `central-station-33/Make.com-claude-code`. An earlier
+> deploy in this session had unknowingly reverted one of their fixes
+> (`ingest-leads`'s `verify_jwt`); corrected, and both that incident and
+> this session's changes are now logged in that repo's shared changelog
+> (PR #22) per its coordination convention. Relevant context for anyone
+> reading this report cold: state changes to these functions or scenarios
+> are not guaranteed to trace back to this session alone going forward.
 
 ---
 
@@ -108,7 +126,7 @@ the lead's actual assigned agent.
 | Inbound SMS (S18) and email parser (S17) | Never executed | Both active since 2026-09-06 with zero runs. |
 | Follow-up cadence (`follow-up-cadence`) | Not scheduled | The only scenario that calls it, **ISA S19 – Follow-up Cadence** (id 5094961), is inactive and marked invalid. Note the name collision: this is a different scenario from **ISA S19: High-Value Homeowner Bridge** (id 6187369), which is active and was moved from 35 ops/run to 1 today — see §7. Worth renaming one of them before it causes a wrong-scenario mistake. |
 | Skip trace (DataSkip) | Wired, spend gated | 2 confirmations issued, 2 leads matched, 18 no-match. Two-step approval gate works as designed. |
-| AI routing (`bant_score` → `routing`) | **Broken, confirmed at full scale, still not fixed** | Re-checked against all 162 current leads (up from the 172-row sample that included dedupe-backup rows): 143 agree with the prompt's own stated rules, **19 violate them (11.7%)** — consistent with the original 12% estimate, not a fluke of the smaller sample. `enrich-leads` still trusts the model's `routing` string instead of deriving it from `bant_score`. See 4.7. Not authorised for a code fix as of this revision. |
+| AI routing (`bant_score` → `routing`) | **RESOLVED — 162/162 agree with the stated rules, 0 violations** | `enrich-leads` v41 now derives `routing` in code instead of trusting the model. The 19 already-wrong live rows were backfilled from stored scores at no additional cost. Two of the 19 were `hot`→`warm` demotions already reflected in real notification emails sent before the fix — noted, not hidden. See 4.7. |
 | Dashboard / login | **Does not exist in production** | See section 6. |
 
 Confidence: Verified for every row except cadence scheduling (Likely; the
@@ -636,7 +654,7 @@ Fix: put an aggregator (or a second route off a router) between module 4 and
 module 5, so modules 5–7 run once after the loop finishes rather than inside
 it.
 
-### 4.7 NEW: routing is taken from the model, not derived from the score
+### 4.7 RESOLVED 2026-09-21 ~23:35 UTC — routing was taken from the model, not derived from the score
 
 This was invisible while everything 401'd. Fixing the Anthropic key made it
 visible, and it affects the one field an ISA acts on directly.
@@ -690,23 +708,54 @@ not called. `notify-isa` has separate hot and warm paths keyed on this field
 (the two calls inside the S2 iterator, section 4.6), so a wrong routing value
 does not just mis-sort a list, it changes whether a notification fires at all.
 
-Fix: derive it. Delete the model's `routing` from the write and compute it
-from `bantScore` and the clamped `motivation_score` using the four rules
-above. Keep `routing` in the requested JSON shape if you want the model's
-opinion recorded, but write it to a separate advisory column rather than the
-one the pipeline reads. This is a ~6-line change in `enrich-leads` and it
-makes the field reproducible from data already stored on every row.
+**Fix, deployed as `enrich-leads` v41.** Added `deriveRouting(bantScore,
+motivationScore)`, applying the same four rules shown above in code instead
+of trusting the model's word. The model's `routing` field is still requested
+in the prompt (unchanged — no reason to touch a working prompt for a
+post-processing fix) but no longer read. A null score (missing/unparseable
+model output) is treated as `0` — the safe floor, not an inflated guess — so
+a parsing failure degrades toward `cold`, never toward `hot`.
+
+The `...(routing ? { routing } : {})` spread that let a malformed `routing`
+silently leave the column at its previous value is also gone — `deriveRouting`
+always returns one of the four strings, so the field is always written.
+
+**Backfilled the 19 already-wrong live rows** from `bant_score`/
+`motivation_score` already stored on each — no re-enrichment, no additional
+Anthropic spend. Re-verified immediately after: **162/162 agree with the
+rules, 0 violations**, up from 143/162 (11.7% wrong) before. The fix works on
+data, not just in theory.
+
+**One real-world consequence worth stating plainly.** Two of the 19
+corrections were `hot` → `warm` demotions (both athlete-segment leads), and
+both had already gone out in real notification emails (section 4.5) labeled
+`HOT` before this fix landed. The notification itself was correct to fire —
+those are still real, worthwhile leads — but the urgency label on those two
+emails was wrong at send time. Not data corruption, not silently swept under
+the rug: recorded here and in the shared multi-agent changelog (see below) so
+it isn't lost.
+
+**Coordination note.** This repository's Supabase project and Make team are
+also modified directly by a second AI agent (Perplexity Computer, working
+from a separate coordination repo,
+`central-station-33/Make.com-claude-code`). Mid-way through this fix a
+changelog documenting that arrangement was found, which also surfaced that an
+earlier deploy in this session (`ingest-leads`, section 4.4) had unknowingly
+reverted a `verify_jwt` fix Perplexity had made to the same function about an
+hour earlier — corrected, and both incidents are logged in that repo's
+`docs/notes/shared-edge-function-changelog.md` (PR #22) going forward. Worth
+knowing if `enrich-leads`, `ingest-leads`, or the Notify Receiver scenario
+show unexplained state changes later: check that log before assuming this
+session caused it.
 
 Two related notes on the same write path:
 
-- The `...(routing ? { routing } : {})` spread means a malformed `routing`
-  leaves the column at whatever it was before, silently. On a re-enrichment
-  that is a stale value presented as fresh. Deriving it removes the branch.
 - `bant_score` itself is sound — the component-sum fallback is well built and
   the CHECK-constraint clamping before the write is the right instinct. The
-  defect is narrow and local to `routing`.
-
-**Not yet fixed.** Unlike 4.1 and 4.4, no change has been made for this.
+  defect was narrow and local to `routing`, and is now closed.
+- Source added to the repo at `supabase/functions/enrich-leads/index.ts`
+  (previously untracked, same drift noted in §2.1/2.2 and already partly
+  addressed for `ingest-leads`).
 
 ## 5. Data quality snapshot
 
