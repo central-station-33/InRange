@@ -16,9 +16,15 @@ this session.
 > handler was swapped from `Ignore` to `Resume`. The scenario now completes
 > without a Gemini API error, and **still writes nothing** — all 50
 > `write-enrichment` calls in the 16:14–16:22 run returned 422. The Anthropic
-> path is unchanged (`401`). That re-check also surfaced a new structural bug
-> in S2, section 4.6. Superseded numbers are marked as such rather than
-> deleted.
+> path is unchanged, and a replacement key installed at 18:30 UTC returned
+> "API key is invalid" from a cold isolate (section 4.1). That re-check also
+> surfaced a new structural bug in S2, section 4.6. Superseded numbers are
+> marked as such rather than deleted.
+>
+> **Further update ~18:40 UTC:** the project owner confirms the Gemini
+> prepay top-up has not landed yet and is expected to take a few hours.
+> That confirms the cause of the 422s in section 4.2 and creates a specific
+> risk when the credits do arrive — see the trap described there.
 
 ---
 
@@ -30,8 +36,8 @@ The pipeline ingests, but nothing downstream of ingestion works today.
 |---|---|---|
 | Property ingestion (NYC HPD, evictions, NJ MOD-IV) | Working, last run 2026-09-14 | 879 raw rows, 915 properties, 0 unprocessed |
 | ISA lead ingestion (ACRIS divorce, empty-nester, developer) | Working, but producing duplicates | 534 leads created today, only 149 distinct addresses across the table |
-| AI enrichment, Anthropic path (`enrich-leads`, `enrich-pending`) | **Broken** | Every call returns `Anthropic 401`, 50 of 50 leads, most recently the 16:22:55 UTC run. Key is set (108 chars) but rejected. On 2026-09-15 the error was "credit balance too low". |
-| AI enrichment, Gemini path (S2 via `list-pending-enrichment` → `write-enrichment`) | **Broken, new failure mode** | The Gemini API errors are gone as of the 16:14 edit, but all 50 `write-enrichment` calls in the 16:14–16:22 run returned **422** ("No JSON object in model response"). Zero leads carry a Gemini model tag. |
+| AI enrichment, Anthropic path (`enrich-leads`, `enrich-pending`) | **Broken** | `401 authentication_error — "API key is invalid."` A replacement key installed 18:30 UTC did not fix it; a stale worker was ruled out by testing a cold isolate. See 4.1. |
+| AI enrichment, Gemini path (S2 via `list-pending-enrichment` → `write-enrichment`) | **Blocked on billing** | All 50 `write-enrichment` calls in the 16:14–16:22 run returned **422**, caused by an empty Gemini prepay balance the `Resume` handler masked. Top-up pending as of 18:40 UTC. The response mapping remains unproven. See 4.2. |
 | Lead assignment (`assign-leads`) | Working for 5 of 8 active segments | 195 leads assigned, all to the one agent. `divorce`, `empty_nester`, `homeowner`, `landlord` have no routing rule, so 432 leads sit unassigned. |
 | ISA notification (`notify-isa` → Make receiver) | Idle, not proven | Every run today ends `no_leads_matched` because no lead has both `ai_summary` and `outreach_status='new'`. The receiver scenario only logs a touch; it sends no SMS or email. |
 | Inbound lead fast response (S16 → `respond-lead`) | **Broken** | Last two real inbound events (2026-09-17) failed with `BundleValidationError` before reaching the edge function. |
@@ -216,9 +222,42 @@ worth one probe once the key works, because `respond-lead` is the inbound
 auto-responder and a silent 404 there means inbound leads get the canned
 fallback SMS instead of a written reply.
 
-Fix: generate a new key, set it as the `ANTHROPIC_API_KEY` edge-function
-secret, re-run one `enrich-leads` call with `limit: 1`, and confirm
-`ai_model` and `ai_enriched_at` land on that row.
+**Update, 2026-09-21 18:30 UTC — a new key was installed and did not fix
+it.** Tested directly through two functions. Anthropic's verbatim response:
+
+```
+401 {"type":"error","error":{"type":"authentication_error",
+     "message":"API key is invalid."},"request_id":null}
+```
+
+That is more specific than the earlier reading. It is not an expiry, not a
+balance problem (which returns a 400 with a distinct message, as on
+2026-09-15), and not workspace scoping (a 400 naming
+`anthropic-workspace-id`). The key string reaching Anthropic is being
+rejected outright, and `request_id: null` means it was discarded before
+becoming a request.
+
+A stale warm worker was ruled out rather than assumed. `enrich-leads`
+captures the key once at module load, so it could serve an old value
+indefinitely; `enrich-pending` reads it inside the handler and had been
+cold since 2026-09-15, so it booted fresh against the currently stored
+secret. Both returned the same error. **A redeploy will not help.**
+
+What is still open: whether the stored secret ever changed. The function
+reports the key length as 108 characters, identical to the previous key —
+which is also the normal length for a valid key, so it discriminates
+nothing. Two checks settle it:
+
+1. `supabase secrets list --project-ref omzugrtgwsjypekuzgtn` prints a
+   digest per secret. An unchanged digest means the save never landed
+   (wrong project — `silent-legacy-media` is also active in that org — or
+   an uncommitted dashboard edit).
+2. Test the key against Anthropic directly from a workstation, which
+   separates "is the key good" from "did Supabase receive it".
+
+Also worth ruling out: a key beginning `sk-ant-admin` is an Admin key and
+is rejected by the Messages API by design. A valid inference key begins
+`sk-ant-api`.
 
 ### 4.2 Gemini (Make module in S2) — new failure mode on re-check
 
@@ -275,16 +314,36 @@ Two candidate causes, and this session could not distinguish them:
    only.…"`, 1,006 chars), meaning the field was mapped to `{{2.prompt}}`
    at that point.
 
-Cause 1 is the more parsimonious fit for a uniform 50-of-50 failure, but
-calling it without evidence would be a guess. **Likely, not Verified.**
+**Cause 1 is confirmed** (project owner, 2026-09-21 ~18:40 UTC): the Gemini
+prepay top-up has not landed on Google's side yet and is expected to take a
+few hours. So the balance was still empty throughout the 16:14–16:22 run.
+Every Gemini call 402'd, `Resume` substituted `candidates: []`, and
+`write-enrichment` received an empty string. That accounts for all 50
+failures without needing cause 2.
 
-The distinguishing diagnostic is one line: `write-enrichment` version 4
-persisted a `diag_write_enrichment_*` row recording `raw_text_length` and
-`raw_text_preview`; version 5 (deployed 14:56) dropped it. Restore that
-persist call, run S2 with `limit: 1`, and the row says immediately whether
-`raw_text` is empty (cause 1) or is populated with the wrong content
-(cause 2). Checking the Google AI Studio prepay balance answers cause 1
-directly and costs nothing.
+**Cause 2 is not thereby excluded, and this is the trap.** The mapping has
+never been observed working. It was demonstrably wrong once already, and
+the two `Resume` handlers now guarantee that a mapping failure and a
+successful run look identical from Make's side: the scenario reports
+SUCCESS either way. When the credits land, a green run is therefore *not*
+evidence that enrichment works.
+
+Do two things before the top-up arrives:
+
+1. **Restore the diagnostic.** `write-enrichment` version 4 persisted a
+   `diag_write_enrichment_*` row recording `raw_text_length` and
+   `raw_text_preview`; version 5 (deployed 14:56) dropped it. Without it
+   there is no record of what the endpoint actually received.
+2. **Reconsider the `Resume` handlers.** `Ignore` at least skipped a failed
+   lead. `Resume` feeds a known-bad bundle downstream and burns two
+   operations per lead doing it, while converting a visible failure into a
+   silent one.
+
+Then verify on evidence, not on run status: after the credits land, run S2
+with `limit: 1` and check that an `isa_leads` row has
+`ai_model = 'gemini-3.6-flash'` and a non-null `ai_enriched_at`. As of this
+writing no row in the table has ever had a non-null `ai_model`, so any
+non-null value is proof the path completed end to end.
 
 ### 4.3 Supabase edge functions
 
