@@ -56,17 +56,30 @@ this session.
 > Separately, the ops-reduction work from earlier today (S19, S1b, S1c, S1d)
 > is Make/Supabase configuration, not a repo change, and isn't detailed here;
 > see the PR conversation for that trail.
+>
+> **Notification delivery built, ~23:10 UTC.** The "ISA Notify Receiver"
+> Make scenario did nothing but acknowledge its webhook — added a real
+> Gmail send step using the account's existing OAuth connection. Also found
+> and fixed: `notify-isa` was marking leads `'attempting'` (permanently
+> un-retryable) on webhook-200 regardless of whether anything downstream
+> actually sent, which had already silently stranded all 23 current hot/warm
+> leads. Reset them and re-ran for real: **23/23 sent**, verified against 23
+> individual Make executions, not just the caller's success count. See
+> revised 4.5. Not a repo change — Make/Supabase configuration only.
 
 ---
 
 ## 1. Bottom line
 
-**Re-verified live at ~22:50 UTC**, roughly four hours after the previous
-revision. The pipeline now enriches and assigns everything it ingests. It
-still delivers nothing to an ISA: 162 leads are enriched, scored, and
-assigned, and `lead_touches`/`notification_log` are both 0. That gap —
-not enrichment, not assignment — is now the single blocker between a
-working backend and an ISA doing anything with it.
+**Updated ~23:10 UTC.** The pipeline now enriches, assigns, and *delivers*.
+As of this revision 23 real emails have been sent to the agent for hot and
+warm leads (7 and 16 respectively), verified against 23 individual Make
+executions, not just an API success count. `lead_touches`/`notification_log`
+staying at 0 is now expected, not a gap — those track a human ISA's logged
+outcome of the call, a separate step after this notification, not a broken
+delivery channel. What's actually left: SMS/Slack are unbuilt (no connection
+exists), and the email step is single-agent-only — it doesn't yet route by
+the lead's actual assigned agent.
 
 | Stage | Status | Evidence |
 |---|---|---|
@@ -75,7 +88,7 @@ working backend and an ISA doing anything with it.
 | AI enrichment, Anthropic path (`enrich-leads`, `enrich-pending`) | **Working** (as of 2026-09-21 ~19:20 UTC) | Live call returned `enriched: 1`, 358 input / 596 output tokens, and wrote `ai_summary`, BANT and routing to a real lead. The 401 was a bad key string, fixed on the third replacement. See 4.1. |
 | AI enrichment, Gemini path (S2 via `list-pending-enrichment` → `write-enrichment`) | **Blocked on billing, status unchanged** | All 50 `write-enrichment` calls in the 16:14–16:22 run returned **422**, caused by an empty Gemini prepay balance the `Resume` handler masked. Top-up pending as of 18:40 UTC, not re-checked since. The response mapping remains unproven. See 4.2. |
 | Lead assignment (`assign-leads`) | **Working — 100% of current leads assigned** | Re-checked live: all 162 leads carry `assigned_agent_id`, all to the sole agent. A wildcard rule (`segment: null`, priority 99) added to `agent_routing_rules` since the original finding catches everything the 11 named rules don't. See revised 4.5 — the original "no rule, 432 unassigned" claim is corrected there, not deleted. |
-| ISA notification (`notify-isa` → Make receiver) | **Idle — now the binding constraint** | Re-checked live: `lead_touches` and `notification_log` are both 0 rows, same as before, but now against 162 fully-enriched, fully-assigned leads rather than mostly-unenriched ones. The receiver scenario only logs a touch; it sends no SMS or email. This is the next thing to fix. |
+| ISA notification (`notify-isa` → Make receiver) | **RESOLVED — real email delivery built and verified** | The receiver scenario did nothing but ack a webhook (not even `log-touch`, contrary to what this report previously said). Added a `google-email:sendAnEmail` module using the account's existing Gmail connection. 23/23 hot+warm leads sent, confirmed against 23 individual Make executions. A related bug (notify-isa marking leads `'attempting'` on webhook-200 regardless of real delivery, permanently stranding them) was also found and reset. SMS/Slack still unbuilt — no connection exists for either. See revised 4.5. |
 | Inbound lead fast response (S16 → `respond-lead`) | **Broken** | Last two real inbound events (2026-09-17) failed with `BundleValidationError` before reaching the edge function. |
 | Inbound SMS (S18) and email parser (S17) | Never executed | Both active since 2026-09-06 with zero runs. |
 | Follow-up cadence (`follow-up-cadence`) | Not scheduled | The only scenario that calls it, **ISA S19 – Follow-up Cadence** (id 5094961), is inactive and marked invalid. Note the name collision: this is a different scenario from **ISA S19: High-Value Homeowner Bridge** (id 6187369), which is active and was moved from 35 ops/run to 1 today — see §7. Worth renaming one of them before it causes a wrong-scenario mistake. |
@@ -506,16 +519,40 @@ priority 99, regardless of who should actually own it. Named rules per
 segment are still the correct fix before hiring; noting it here so it
 doesn't get re-discovered as a surprise later.
 
-- **Notification is still where it was.** `lead_touches` and
-  `notification_log` are both 0 rows, checked live — same as originally
-  reported. 162 leads are now enriched and assigned and **not one has been
-  touched.** The Notify Receiver scenario failed 11 times on 2026-09-07 with
-  `Validation failed for 7 parameter(s)` (the email/SMS modules that existed
-  then). It has since been cut down to a single `log-touch` call. There is
-  currently **no delivery channel** for ISA notifications: no SMS, no email,
-  no Slack. This is now the single largest gap between "the pipeline works"
-  and "an ISA does anything with it." **Verified from blueprint and live
-  counts.**
+- **RESOLVED, 2026-09-21 ~23:05 UTC.** Notification delivery is now real.
+  The "ISA Notify Receiver" Make scenario (id 5077766) had shrunk to a bare
+  webhook-in/webhook-respond pair with nothing in between — not even the
+  single `log-touch` call this section previously described; it did
+  literally nothing but acknowledge receipt. A `google-email:sendAnEmail`
+  module was added between them, using the Gmail OAuth connection already
+  live on this account (proven working elsewhere, in the inactive
+  "Unclaimed Landlord Lead Alert" scenario), sending to the sole agent's
+  address with the lead's name, AI summary, talking points, BANT/motivation
+  scores, contact info and commission split — all fields `notify-isa`
+  already assembled but had nowhere to send.
+
+  A second, related bug surfaced in the same pass: `notify-isa` marks a lead
+  `outreach_status = 'attempting'` as soon as the webhook call returns 200 —
+  and the old empty receiver always returned 200. So every prior notify
+  attempt "succeeded" and permanently removed the lead from the `'new'`
+  pool notify-isa re-queries, without anything ever being sent. All 7 hot
+  and 16 warm leads were stuck this way. They were reset to `'new'` and
+  `notify-isa` was re-run for real for both routings: **23/23 sent, 0
+  errors**, confirmed against 23 individual Make executions
+  (`status: 1, operations: 3` — webhook → email → respond — each), not
+  just the caller's success count. 23 real emails landed in the agent's
+  inbox. **Verified end to end**, not by config review.
+
+  Still open: SMS and Slack are unbuilt (no Twilio or Slack connection
+  exists on this Make team), so `sms_message` — a field `notify-isa` has
+  built into its payload since before this fix — is composed and unused.
+  Single-agent-only: the email module hardcodes the one connected address;
+  the moment a second agent exists this needs to route by the lead's actual
+  assigned agent, which `notify-isa`'s payload doesn't currently carry (only
+  `assigned_agent` as a display name, not an address). `lead_touches` and
+  `notification_log` remain 0 — correctly: those track an ISA's logged
+  outcome of actually calling the lead (via `log-touch`), a distinct,
+  still-manual step downstream of this notification, not a defect in it.
 
 ---
 
