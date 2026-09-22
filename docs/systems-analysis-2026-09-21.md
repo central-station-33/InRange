@@ -57,6 +57,31 @@ this session.
 > is Make/Supabase configuration, not a repo change, and isn't detailed here;
 > see the PR conversation for that trail.
 >
+> **Dashboard finding corrected, 2026-09-22 ~00:35 UTC.** Section 6.2 called
+> the dashboard "not built" and left `make-com-claude-code` "Unverified"
+> because the Vercel token in this session couldn't read that team (403 on
+> every scoped call). A user-supplied deployment link forced a retry with a
+> corrected deployment ID, which worked unscoped and reversed the finding:
+> **the dashboard is built, deployed, and live.** `central-station-33/Make.com-claude-code`
+> is a full Vite/React/shadcn app (`src/pages`, `src/routes`,
+> `src/integrations/supabase/inrange.ts` wired to this same project,
+> `omzugrtgwsjypekuzgtn`) with real pages — Sales Funnel, Profile,
+> Communications, an `AppLayout` shell — deployed to Vercel project
+> `make-com-claude-code`, aliased to **`inrange.jetreadvisors.com`**, the
+> real production domain. This was reported to the user mid-session as a
+> likely misconfiguration ("production domain pointing at the wrong repo");
+> reading the repo's actual contents disproved that before any change was
+> made — repointing the domain to `nextjs-inrange`, a bare `create-next-app`
+> scaffold with no Supabase dependency, would have replaced a working app
+> with a blank template. No Vercel change was made. The real, narrower
+> problem: the repo that *is* the InRange frontend is named
+> `Make.com-claude-code` (its own `package.json` still reads
+> `vite_react_shadcn_ts`, a generator default) and carries no visible link
+> back to `InRange`/`nextjs-inrange`, while `nextjs-inrange` — the
+> obviously-named candidate — is dead weight. Item 11 in section 7 and the
+> "Unverified" line in 6.2 are corrected in place below rather than
+> silently changed.
+>
 > **Notification delivery built, ~23:10 UTC.** The "ISA Notify Receiver"
 > Make scenario did nothing but acknowledge its webhook — added a real
 > Gmail send step using the account's existing OAuth connection. Also found
@@ -799,7 +824,14 @@ in the database. What does not exist:
 
 ### 6.2 Dashboard
 
-**Not built.** Three candidates were examined:
+> **CORRECTED 2026-09-22 ~00:35 UTC.** This section originally concluded
+> "not built" and left the fourth candidate below "Unverified" because a
+> scoped Vercel API call 403'd. An unscoped retry (see the header addendum)
+> confirmed it: the dashboard exists, is deployed, and is live at the real
+> production domain. Original text kept below with the correction appended
+> rather than rewritten in place.
+
+Three candidates were examined and found wanting:
 
 | Candidate | State |
 |---|---|
@@ -809,9 +841,33 @@ in the database. What does not exist:
 
 `fetch-properties` contains a comment about "PrivateRoute" and a browser
 frontend calling it with a user session. No such frontend exists in either
-repository. The Vercel account has projects named `cc-make-retool` and
-`make-com-claude-code` under a team this session's token cannot read
-(403), so a deployed frontend there cannot be ruled out. **Unverified.**
+repository above.
+
+**A fourth candidate was the actual answer: `central-station-33/Make.com-claude-code`.**
+Its `package.json` name is `vite_react_shadcn_ts` — an unrenamed scaffold
+default — but its README opens "InRange — Investor Lead Generator" and its
+tree is a complete, real application: `src/pages`, `src/routes`,
+`src/components`, `src/integrations/supabase/inrange.ts` and `client.ts`
+(both wired to `omzugrtgwsjypekuzgtn`, the same project this pipeline
+runs on), `supabase/functions`, `supabase/migrations`, a `public-site/`
+with real marketing pages (`find-my-rental.html`, `lease-my-property.html`),
+and Make.com scenario backups/blueprints for the same 18 active scenarios
+in Appendix A. Vercel project `make-com-claude-code`
+(`prj_nOePJcq0wPWzE7mxjvktOec2C3sO`, framework `vite`) builds it from
+`main` on every push and aliases the result to `inrange.jetreadvisors.com`
+— the real production domain — alongside two `*.vercel.app` fallback
+aliases. The latest production deployment at the time of this check
+(`dpl_A21oE2YdSz6bDnAACjLp3GrbSEW9`, commit `e8c7856`) was `READY`.
+
+**Confidence: Verified** (direct read of the repo tree plus the Vercel
+project/deployment API, not the earlier 403-blocked inference).
+
+Item 11 in section 7 ("decide where the dashboard lives") is therefore
+moot as originally scoped — a dashboard already lives somewhere, is
+deployed, and is serving the real domain — and is replaced by a narrower
+hygiene item below: the repo doing that job is discoverable only by
+reading its contents, not its name, and `nextjs-inrange` is dead weight
+sitting on the name a reader would actually guess.
 
 ### 6.3 Other open work (from PR titles and branch contents)
 
@@ -879,9 +935,16 @@ Remaining, in order:
    person clicking Run.
 10. **Merge PR #13, then re-sync** the 7 missing functions and 3 migrations,
     and close the 10 PRs that no longer reflect the system.
-11. **Decide where the dashboard lives.** Either build `nextjs-inrange` out
-    using the existing role-based RLS with the anon key (not the service-role
-    key), or move PR #4's `dashboard/` there and rewrite its data layer.
+11. ~~Decide where the dashboard lives.~~ **Moot — corrected 2026-09-22,
+    section 6.2.** It already lives in `Make.com-claude-code`, deployed to
+    `inrange.jetreadvisors.com`. Replaced by: **rename or re-home that repo**
+    so its GitHub name matches what it actually is (the InRange frontend,
+    not a Make.com/Claude Code utility project), and **retire
+    `nextjs-inrange`** — a same-named dead scaffold sitting on the name a
+    reader would guess for the real app, which is exactly how this got
+    misread as "dashboard not built" in the first place. Not yet done;
+    requires the user's decision on which repo name/URL to keep, and isn't
+    a change to make unilaterally on a production-serving repo.
 12. **Consent gate before any outbound SMS.** Require `sms_consent=true` in
     `follow-up-cadence`, and treat inbound-SMS replies as the only implied
     consent.
@@ -927,7 +990,12 @@ residential_sale_pipeline, segment_roi, unclaimed_leads.
 
 ## Appendix B: What could not be checked
 
-- Vercel deployments and environment variables (token lacks team scope).
+- ~~Vercel deployments and environment variables (token lacks team scope).~~
+  **Partially resolved 2026-09-22:** project/deployment reads work when
+  `teamId` is omitted (see corrected section 6.2); `get_deployment` /
+  `list_deployments` / `get_project` still 403 the moment `teamId` is passed
+  explicitly. Environment variables were not read either way — still
+  unchecked.
 - Supabase Auth provider settings beyond the advisor output.
 - Twilio account state (number, A2P 10DLC registration, message logs); the
   Twilio tools available here are documentation search only.
