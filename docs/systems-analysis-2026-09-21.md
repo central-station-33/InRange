@@ -124,6 +124,14 @@ this session.
 > (PR #22) per its coordination convention. Relevant context for anyone
 > reading this report cold: state changes to these functions or scenarios
 > are not guaranteed to trace back to this session alone going forward.
+>
+> **Frontend repo renamed, 2026-09-22 ~00:55 UTC.** At the project owner's
+> direction, `Make.com-claude-code` — the repo identified in the dashboard
+> correction above as the real, live InRange frontend — was renamed to
+> `inrange-frontend`. Verified with a real push, not assumed: the commit
+> built and deployed correctly under the new name and GitHub redirects the
+> old name transparently, so nothing broke. Item 11 in section 7 is updated
+> in place. `nextjs-inrange` (the dead scaffold) was left as-is.
 
 ---
 
@@ -935,16 +943,19 @@ Remaining, in order:
    person clicking Run.
 10. **Merge PR #13, then re-sync** the 7 missing functions and 3 migrations,
     and close the 10 PRs that no longer reflect the system.
-11. ~~Decide where the dashboard lives.~~ **Moot — corrected 2026-09-22,
-    section 6.2.** It already lives in `Make.com-claude-code`, deployed to
-    `inrange.jetreadvisors.com`. Replaced by: **rename or re-home that repo**
-    so its GitHub name matches what it actually is (the InRange frontend,
-    not a Make.com/Claude Code utility project), and **retire
-    `nextjs-inrange`** — a same-named dead scaffold sitting on the name a
-    reader would guess for the real app, which is exactly how this got
-    misread as "dashboard not built" in the first place. Not yet done;
-    requires the user's decision on which repo name/URL to keep, and isn't
-    a change to make unilaterally on a production-serving repo.
+11. ~~Decide where the dashboard lives.~~ **Done — 2026-09-22 ~00:55 UTC.**
+    It already lived in `Make.com-claude-code`, deployed to
+    `inrange.jetreadvisors.com` (section 6.2). At the project owner's
+    direction, that repo was renamed to `inrange-frontend`; verified with a
+    real push afterward (not assumed): the commit built and deployed
+    correctly under the new name (`githubRepo: "inrange-frontend"` in the
+    Vercel deployment metadata, `READY` in under 15s), and GitHub
+    transparently redirects the old name for both git and API access, so no
+    existing clone or integration broke. Logged in the shared changelog and
+    in `inrange-frontend` PR #23. `nextjs-inrange` (the dead scaffold) was
+    not touched — still sitting there unretired, lower priority now that the
+    name confusion that mattered (the live app being unreachable by name)
+    is fixed.
 12. **Consent gate before any outbound SMS.** Require `sms_consent=true` in
     `follow-up-cadence`, and treat inbound-SMS replies as the only implied
     consent.
