@@ -123,26 +123,15 @@ serve(async (req) => {
     parseError = (e as Error).message;
   }
 
-  // Hex-encode rather than store rawText directly: the previous attempt at
-  // this diagnostic failed with "unsupported Unicode escape sequence" --
-  // the raw body itself contains a malformed/lone UTF-16 surrogate that
-  // breaks Postgres's JSON encoding when embedded as a plain string. Hex
-  // bytes are always JSON-safe and let this be decoded afterward.
-  const rawBytesHex = Array.from(new TextEncoder().encode(rawText))
-    .map((b) => b.toString(16).padStart(2, '0')).join(' ');
-
-  // console.log, not persistDiag, for this one: the DB insert path itself
-  // kept failing on "unsupported Unicode escape sequence" even after
-  // hex-encoding the body AND sanitizing lone surrogates out of every
-  // string field -- meaning something about routing this data through
-  // JSON.stringify -> PostgREST -> Postgres jsonb input is where the
-  // corruption survives, not the field contents themselves. console.log
-  // output goes straight to the edge runtime's log stream as plain text,
-  // with no JSON/jsonb encoding step at all, so it can't hit this class of
-  // bug. Once the actual bytes are visible here, this can go back through
-  // persistDiag if still useful.
+  // console.log, not persistDiag: a DB-persisted version of this diagnostic
+  // kept failing on "unsupported Unicode escape sequence" (root-caused and
+  // fixed upstream in Make -- the body wasn't being JSON-serialized before
+  // being bound into this endpoint's raw HTTP body, so the request carried
+  // a truncated/garbled payload). console.log goes straight to the edge
+  // runtime's log stream as plain text with no JSON/jsonb encoding step,
+  // so a one-line summary here is enough to catch a regression without
+  // writing the full body to the log on every run.
   console.log(`[diag:request] content_type=${req.headers.get('content-type')} raw_text_length=${rawText.length} parsed_is_array=${Array.isArray(rawBody)} parsed_type=${typeof rawBody} parse_error=${parseError ?? 'none'}`);
-  console.log(`[diag:request:hex] ${rawBytesHex}`);
 
   // Accept either the plain top-level array (the Make-friendly contract
   // documented above) or {market, source_name, listings} for direct testing.
