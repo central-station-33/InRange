@@ -284,6 +284,30 @@ serve(async (req) => {
   return json({ success: true, data: results });
 });
 
+// Replaces any unpaired UTF-16 surrogate with U+FFFD. JSON.parse()'s own
+// error message for malformed input embeds the actual offending character
+// from the input text -- so even after hex-encoding the raw body bytes,
+// storing that error message verbatim reintroduced the same lone surrogate
+// and broke Postgres's JSON encoding all over again (confirmed: the insert
+// still failed with "unsupported Unicode escape sequence" after the
+// hex-encoding fix, on the `parse_error` field). Applied recursively so any
+// future diagnostic payload (e.g. raw_response_sample, which holds actually
+// -parsed rows that can still carry lone surrogates from a validly-escaped
+// \uD800-range sequence) is safe too.
+function sanitizeForJson(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.replace(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/g,
+      '�',
+    );
+  }
+  if (Array.isArray(value)) return value.map(sanitizeForJson);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, sanitizeForJson(v)]));
+  }
+  return value;
+}
+
 async function persistDiag(supabase: ReturnType<typeof getServiceClient>, stageKey: string, data: Record<string, unknown>) {
   // Plain insert, not upsert: raw_properties.property_hash has no unique
   // constraint, so `.upsert(..., { onConflict: 'property_hash' })` fails
@@ -297,7 +321,7 @@ async function persistDiag(supabase: ReturnType<typeof getServiceClient>, stageK
     const { error } = await supabase.from('raw_properties').insert({
       property_hash: `diagnostic_ingest_rental_landlord_leads_${stageKey}_${Date.now()}`,
       source: 'diagnostic',
-      raw_data: { ran_at: new Date().toISOString(), ...data },
+      raw_data: sanitizeForJson({ ran_at: new Date().toISOString(), ...data }),
       processed_at: new Date().toISOString(),
     });
     if (error) console.error('persistDiag insert failed:', error.message);
