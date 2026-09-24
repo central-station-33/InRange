@@ -27,9 +27,16 @@
  * JSON body, which is exactly the kind of templating that's easy to get
  * subtly wrong and impossible to verify without live network access.
  *
- * Each listing is read defensively via FIELD_CANDIDATES (same pattern as
- * ingest-nj-developer-leads) since exact Apify actor output field names
- * were not verified live from this environment.
+ * Field names below are VERIFIED against a live run of
+ * fatihtahta/hotpads-scraper (2026-09-24): its output is deeply nested
+ * (e.g. `location.address.street`, `pricing.rent.min`), not the flat
+ * top-level names originally guessed here before that run existed. `pick`
+ * resolves dot-paths so a candidate list can mix nested paths (real,
+ * verified) with flat fallbacks (for a different actor, e.g. StreetEasy,
+ * whose output shape hasn't been verified live). HotPads has no email
+ * field and no explicit availability-date field at all -- those stay
+ * null rather than guessing, since a wrong inferred value (e.g. treating
+ * `listing.published_at` as move-in availability) is worse than absent.
  */
 
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
@@ -38,29 +45,43 @@ import { getServiceClient } from '../_shared/supabase-client.ts';
 const MAKE_SECRET = Deno.env.get('MAKE_WEBHOOK_SECRET') ?? '';
 
 const FIELD_CANDIDATES = {
-  address: ['address', 'street_address', 'streetAddress', 'location'],
-  city: ['city', 'addressCity'],
-  zip: ['zip', 'zipcode', 'postal_code', 'addressZipcode'],
-  rent: ['rent', 'price', 'monthly_rent', 'monthlyRent', 'listPrice'],
-  bedrooms: ['bedrooms', 'beds', 'numBedrooms'],
-  bathrooms: ['bathrooms', 'baths', 'numBathrooms'],
-  sqft: ['sqft', 'square_footage', 'livingArea', 'floorSize'],
-  contactName: ['contact_name', 'contactName', 'ownerName', 'listedBy', 'agentName'],
-  contactPhone: ['contact_phone', 'contactPhone', 'phone', 'phoneNumber'],
-  contactEmail: ['contact_email', 'contactEmail', 'email'],
-  listingUrl: ['listing_url', 'listingUrl', 'url', 'detailUrl'],
+  address: ['location.address.street', 'address', 'street_address', 'streetAddress'],
+  city: ['location.address.city', 'location.city', 'city'],
+  zip: ['location.address.postal_code', 'location.postal_code', 'zip', 'zipcode'],
+  rent: ['pricing.rent.min', 'pricing.price_min', 'rent', 'price', 'monthly_rent'],
+  bedrooms: ['property.bedrooms.min', 'bedrooms', 'beds'],
+  bathrooms: ['property.bathrooms.value', 'property.bathrooms.min', 'bathrooms', 'baths'],
+  sqft: ['property.floor_area_sqft.min', 'sqft', 'square_footage', 'livingArea'],
+  contactName: ['contact_details.name', 'contact_details.contacts.contact_name', 'contactName', 'ownerName'],
+  contactPhone: ['contact_details.phone', 'contact_details.contacts.contact_phone', 'contactPhone', 'phone'],
+  contactEmail: ['contact_details.email', 'contactEmail', 'email'],
+  listingUrl: ['entity.url', 'source_context.listing_url', 'listingUrl', 'url'],
   availableDate: ['available_date', 'availableDate', 'availabilityDate'],
-  photos: ['photos', 'images', 'photoUrls'],
-  description: ['description', 'body', 'remarks'],
-  petPolicy: ['pet_policy', 'petPolicy', 'pets'],
+  photos: ['media.image_urls', 'media.main_image_url', 'photos', 'images'],
+  description: ['entity.description', 'description', 'body'],
+  petPolicy: ['property.pets_allowed', 'pet_policy', 'petPolicy', 'pets'],
   furnished: ['furnished', 'isFurnished'],
 };
 
+function getPath(obj: unknown, path: string): unknown {
+  return path.split('.').reduce<unknown>((acc, key) => {
+    if (acc === null || acc === undefined || typeof acc !== 'object') return undefined;
+    return (acc as Record<string, unknown>)[key];
+  }, obj);
+}
+
 function pick(row: Record<string, unknown>, candidates: string[]): unknown {
-  for (const key of candidates) {
-    if (row[key] !== undefined && row[key] !== null && row[key] !== '') return row[key];
+  for (const path of candidates) {
+    const val = getPath(row, path);
+    if (val !== undefined && val !== null && val !== '') return val;
   }
   return undefined;
+}
+
+function mapPetPolicy(val: unknown): string | null {
+  if (val === true) return 'Pets allowed';
+  if (val === false) return 'No pets';
+  return val ? String(val) : null;
 }
 
 function mapFurnished(val: unknown): 'furnished' | 'unfurnished' | null {
@@ -120,7 +141,7 @@ serve(async (req) => {
       const availableDate = availableRaw ? new Date(String(availableRaw)).toISOString().slice(0, 10) : null;
       const photos       = pick(row, FIELD_CANDIDATES.photos);
       const description  = pick(row, FIELD_CANDIDATES.description) as string | undefined;
-      const petPolicy    = pick(row, FIELD_CANDIDATES.petPolicy) as string | undefined;
+      const petPolicy    = mapPetPolicy(pick(row, FIELD_CANDIDATES.petPolicy));
       const furnished    = mapFurnished(pick(row, FIELD_CANDIDATES.furnished));
 
       const stateCode = market === 'nyc' ? 'NY' : 'NJ';
@@ -221,7 +242,8 @@ serve(async (req) => {
 
       results.upserted++;
     } catch (e) {
-      results.errors.push(`${(row as Record<string, unknown>).address ?? 'unknown address'}: ${(e as Error).message}`);
+      const label = pick(row, FIELD_CANDIDATES.address) ?? pick(row, ['entity.title']) ?? 'unknown address';
+      results.errors.push(`${label}: ${(e as Error).message}`);
     }
   }
 
