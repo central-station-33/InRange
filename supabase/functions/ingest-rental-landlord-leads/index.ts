@@ -277,14 +277,25 @@ serve(async (req) => {
 });
 
 async function persistDiag(supabase: ReturnType<typeof getServiceClient>, stageKey: string, data: Record<string, unknown>) {
+  // Plain insert, not upsert: raw_properties.property_hash has no unique
+  // constraint, so `.upsert(..., { onConflict: 'property_hash' })` fails
+  // server-side (Postgres 42P10) on every call. supabase-js returns that
+  // as { error }, it does not throw -- so a try/catch around it (as this
+  // used to be) never sees the failure, and the "diagnostic" silently
+  // writes nothing while looking like it succeeded. Verified via
+  // query_logs against function_edge_logs: every real invocation showed
+  // up there with a 200 response, but zero rows ever landed here.
   try {
-    await supabase.from('raw_properties').upsert({
-      property_hash: `diagnostic_ingest_rental_landlord_leads_${stageKey}`,
+    const { error } = await supabase.from('raw_properties').insert({
+      property_hash: `diagnostic_ingest_rental_landlord_leads_${stageKey}_${Date.now()}`,
       source: 'diagnostic',
       raw_data: { ran_at: new Date().toISOString(), ...data },
       processed_at: new Date().toISOString(),
-    }, { onConflict: 'property_hash' });
-  } catch { /* diagnostics must never break the real response */ }
+    });
+    if (error) console.error('persistDiag insert failed:', error.message);
+  } catch (e) {
+    console.error('persistDiag threw:', (e as Error).message);
+  }
 }
 
 function json(body: unknown, status = 200): Response {
