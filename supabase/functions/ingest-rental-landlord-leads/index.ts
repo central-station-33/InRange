@@ -121,6 +121,7 @@ serve(async (req) => {
 
   const supabase = getServiceClient();
   const results = { fetched: listings.length, upserted: 0, deduped: 0, errors: [] as string[] };
+  const rawSample = listings.slice(0, 2);
 
   for (const row of listings) {
     try {
@@ -247,8 +248,21 @@ serve(async (req) => {
     }
   }
 
+  await persistDiag(supabase, { ...results, raw_response_sample: rawSample });
+
   return json({ success: true, data: results });
 });
+
+async function persistDiag(supabase: ReturnType<typeof getServiceClient>, data: Record<string, unknown>) {
+  try {
+    await supabase.from('raw_properties').upsert({
+      property_hash: 'diagnostic_ingest_rental_landlord_leads',
+      source: 'diagnostic',
+      raw_data: { ran_at: new Date().toISOString(), ...data },
+      processed_at: new Date().toISOString(),
+    }, { onConflict: 'property_hash' });
+  } catch { /* diagnostics must never break the real response */ }
+}
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
