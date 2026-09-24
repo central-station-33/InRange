@@ -131,14 +131,18 @@ serve(async (req) => {
   const rawBytesHex = Array.from(new TextEncoder().encode(rawText))
     .map((b) => b.toString(16).padStart(2, '0')).join(' ');
 
-  await persistDiag(supabase, 'request', {
-    content_type: req.headers.get('content-type'),
-    raw_text_length: rawText.length,
-    raw_bytes_hex: rawBytesHex,
-    parse_error: parseError,
-    parsed_is_array: Array.isArray(rawBody),
-    parsed_type: typeof rawBody,
-  });
+  // console.log, not persistDiag, for this one: the DB insert path itself
+  // kept failing on "unsupported Unicode escape sequence" even after
+  // hex-encoding the body AND sanitizing lone surrogates out of every
+  // string field -- meaning something about routing this data through
+  // JSON.stringify -> PostgREST -> Postgres jsonb input is where the
+  // corruption survives, not the field contents themselves. console.log
+  // output goes straight to the edge runtime's log stream as plain text,
+  // with no JSON/jsonb encoding step at all, so it can't hit this class of
+  // bug. Once the actual bytes are visible here, this can go back through
+  // persistDiag if still useful.
+  console.log(`[diag:request] content_type=${req.headers.get('content-type')} raw_text_length=${rawText.length} parsed_is_array=${Array.isArray(rawBody)} parsed_type=${typeof rawBody} parse_error=${parseError ?? 'none'}`);
+  console.log(`[diag:request:hex] ${rawBytesHex}`);
 
   // Accept either the plain top-level array (the Make-friendly contract
   // documented above) or {market, source_name, listings} for direct testing.
