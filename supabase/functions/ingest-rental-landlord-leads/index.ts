@@ -107,7 +107,31 @@ serve(async (req) => {
   }
 
   const qs = new URL(req.url).searchParams;
-  const rawBody = await req.json().catch(() => null);
+  const supabase = getServiceClient();
+
+  // Read as text first and persist unconditionally, BEFORE any parsing --
+  // a "success" response that silently ingested nothing (as happened here
+  // once already) is indistinguishable from "Apify returned 0 listings"
+  // unless the raw request itself is captured, including the failure case
+  // where it isn't valid JSON at all.
+  const rawText = await req.text();
+  let rawBody: unknown = null;
+  let parseError: string | null = null;
+  try {
+    rawBody = JSON.parse(rawText);
+  } catch (e) {
+    parseError = (e as Error).message;
+  }
+
+  await persistDiag(supabase, 'request', {
+    content_type: req.headers.get('content-type'),
+    raw_text_length: rawText.length,
+    raw_text_sample: rawText.slice(0, 1000),
+    parse_error: parseError,
+    parsed_is_array: Array.isArray(rawBody),
+    parsed_type: typeof rawBody,
+  });
+
   // Accept either the plain top-level array (the Make-friendly contract
   // documented above) or {market, source_name, listings} for direct testing.
   const bodyObj: Record<string, unknown> = Array.isArray(rawBody) ? {} : (rawBody as Record<string, unknown> | null) ?? {};
@@ -119,7 +143,6 @@ serve(async (req) => {
 
   if (!listings.length) return json({ success: true, data: { fetched: 0, upserted: 0, deduped: 0, errors: [] } });
 
-  const supabase = getServiceClient();
   const results = { fetched: listings.length, upserted: 0, deduped: 0, errors: [] as string[] };
   const rawSample = listings.slice(0, 2);
 
@@ -248,15 +271,15 @@ serve(async (req) => {
     }
   }
 
-  await persistDiag(supabase, { ...results, raw_response_sample: rawSample });
+  await persistDiag(supabase, 'results', { ...results, raw_response_sample: rawSample });
 
   return json({ success: true, data: results });
 });
 
-async function persistDiag(supabase: ReturnType<typeof getServiceClient>, data: Record<string, unknown>) {
+async function persistDiag(supabase: ReturnType<typeof getServiceClient>, stageKey: string, data: Record<string, unknown>) {
   try {
     await supabase.from('raw_properties').upsert({
-      property_hash: 'diagnostic_ingest_rental_landlord_leads',
+      property_hash: `diagnostic_ingest_rental_landlord_leads_${stageKey}`,
       source: 'diagnostic',
       raw_data: { ran_at: new Date().toISOString(), ...data },
       processed_at: new Date().toISOString(),
