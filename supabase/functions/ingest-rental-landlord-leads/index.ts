@@ -123,10 +123,18 @@ serve(async (req) => {
     parseError = (e as Error).message;
   }
 
+  // Hex-encode rather than store rawText directly: the previous attempt at
+  // this diagnostic failed with "unsupported Unicode escape sequence" --
+  // the raw body itself contains a malformed/lone UTF-16 surrogate that
+  // breaks Postgres's JSON encoding when embedded as a plain string. Hex
+  // bytes are always JSON-safe and let this be decoded afterward.
+  const rawBytesHex = Array.from(new TextEncoder().encode(rawText))
+    .map((b) => b.toString(16).padStart(2, '0')).join(' ');
+
   await persistDiag(supabase, 'request', {
     content_type: req.headers.get('content-type'),
     raw_text_length: rawText.length,
-    raw_text_sample: rawText.slice(0, 1000),
+    raw_bytes_hex: rawBytesHex,
     parse_error: parseError,
     parsed_is_array: Array.isArray(rawBody),
     parsed_type: typeof rawBody,
