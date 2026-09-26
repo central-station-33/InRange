@@ -17,6 +17,15 @@
  * an omission from auto-routing plus an atomic claim endpoint, not a new
  * status enum.
  *
+ * The unclaimed-lead alert is sent synchronously, right here, via Resend
+ * (see sendUnclaimedLeadAlert) -- not via a separate Make scenario polling
+ * `unclaimed_leads` on a timer through a Gmail OAuth module. That module
+ * reported success on every run but never actually delivered a message
+ * (nothing in Sent, Inbox, or Spam), and Make's API doesn't expose
+ * per-module output for successful runs, making it undiagnosable from the
+ * outside. Sending here means the alert fires the instant a lead is
+ * created and a failure shows up in this function's own logs.
+ *
  * POST /ingest-rental-landlord-leads?market=nj&source_name=hotpads_frbo
  * Body: Array<Record<string, unknown>>  -- raw actor dataset items, as the
  * top-level JSON body (not wrapped in an object). market/source_name ride
@@ -43,6 +52,8 @@ import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
 import { getServiceClient } from '../_shared/supabase-client.ts';
 
 const MAKE_SECRET = Deno.env.get('MAKE_WEBHOOK_SECRET') ?? '';
+const RESEND_API_KEY = Deno.env.get('RESEND_API_KEY') ?? '';
+const ALERT_TO_EMAIL = 'jtaffairs@gmail.com';
 
 const FIELD_CANDIDATES = {
   address: ['location.address.street', 'address', 'street_address', 'streetAddress'],
@@ -266,6 +277,25 @@ serve(async (req) => {
       if (ruErr) throw new Error(`rental_units: ${ruErr.message}`);
 
       results.upserted++;
+
+      // Fire the unclaimed-lead alert synchronously, right here, instead of
+      // via a separate Make scenario polling `unclaimed_leads` every 15
+      // minutes through a Gmail OAuth module. That path reported success on
+      // every run (valid token, correct account, operations consumed) but
+      // never actually delivered -- no message ever showed up in Sent,
+      // Inbox, or Spam, and Make's API doesn't expose per-module output for
+      // successful runs to diagnose why. Resend's HTTP API returns a plain,
+      // inspectable response body, so a failure here is at least visible in
+      // this function's own logs instead of being an opaque "success."
+      await sendUnclaimedLeadAlert({
+        id: newLead.id,
+        propertyAddress: fullAddress,
+        contactName: contactName ?? null,
+        unitCount: 1,
+        expectedRent: rent,
+        motivationSignals,
+        sourceUrl: listingUrl || null,
+      });
     } catch (e) {
       const label = pick(row, FIELD_CANDIDATES.address) ?? pick(row, ['entity.title']) ?? 'unknown address';
       results.errors.push(`${label}: ${(e as Error).message}`);
@@ -320,6 +350,55 @@ async function persistDiag(supabase: ReturnType<typeof getServiceClient>, stageK
     if (error) console.error('persistDiag insert failed:', error.message);
   } catch (e) {
     console.error('persistDiag threw:', (e as Error).message);
+  }
+}
+
+async function sendUnclaimedLeadAlert(lead: {
+  id: string;
+  propertyAddress: string;
+  contactName: string | null;
+  unitCount: number;
+  expectedRent: number | null;
+  motivationSignals: string[];
+  sourceUrl: string | null;
+}) {
+  // Never throws -- a failed alert send must not turn a successfully
+  // ingested lead into a reported error for that row.
+  if (!RESEND_API_KEY) {
+    console.error('sendUnclaimedLeadAlert skipped: RESEND_API_KEY not configured');
+    return;
+  }
+  const contact = lead.contactName ?? 'Unknown';
+  const html = `<p>A new unrepresented-rental landlord lead just came in and has <b>not been claimed</b> by an agent yet.</p>` +
+    `<p><b>Address:</b> ${lead.propertyAddress}<br>` +
+    `<b>Contact:</b> ${contact}<br>` +
+    `<b>Units:</b> ${lead.unitCount} | <b>Expected rent:</b> ${lead.expectedRent ? `$${lead.expectedRent.toLocaleString()}/mo` : 'unknown'}</p>` +
+    `<p><b>Signals:</b><br>${lead.motivationSignals.join('<br>')}</p>` +
+    `<p>Source listing: ${lead.sourceUrl ?? 'n/a'}</p>` +
+    `<p>Lead ID: ${lead.id} (claim via claim-lead with your agent_id)</p>`;
+
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: 'InRange Alerts <onboarding@resend.dev>',
+        to: [ALERT_TO_EMAIL],
+        subject: `New Unclaimed Landlord Lead: ${contact !== 'Unknown' ? contact : lead.propertyAddress}`,
+        html,
+      }),
+    });
+    const bodyText = await res.text();
+    if (!res.ok) {
+      console.error(`sendUnclaimedLeadAlert failed: ${res.status} ${bodyText}`);
+    } else {
+      console.log(`sendUnclaimedLeadAlert sent: ${bodyText}`);
+    }
+  } catch (e) {
+    console.error('sendUnclaimedLeadAlert threw:', (e as Error).message);
   }
 }
 
